@@ -22,7 +22,7 @@
 # %autoreload 2
 
 # %%
-from typing import Callable, Dict, List, Set, Optional, Tuple, Mapping, Sequence, Any, Protocol, MutableMapping
+from typing import Dict, List, Set, Optional, Mapping, Sequence
 from dataclasses import dataclass
 
 # %%

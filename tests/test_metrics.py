@@ -19,21 +19,7 @@
 # %autoreload 2
 
 # %%
-from typing import Optional, Mapping
-
-import operadic_consistency
-
-from operadic_consistency.core.toq_types import NodeId, ToQ, ToQNode
 from operadic_consistency.core.interfaces import Answer
-from operadic_consistency.core.transforms import (
-    CollapsePlan,
-    enumerate_collapse_plans,
-    component_roots,
-    apply_collapse_plan,
-)
-from operadic_consistency.core.evaluate import evaluate_toq
-from operadic_consistency.core.consistency import run_consistency_check
-from operadic_consistency.core.serialization import toq_to_json, toq_from_json
 from operadic_consistency.core.metrics import (
     answer_distribution,
     mode_answer,

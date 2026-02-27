@@ -22,10 +22,8 @@
 # %autoreload 2
 
 # %%
-import operadic_consistency
-
 from dataclasses import dataclass
-from typing import Any, Mapping, MutableMapping, Optional, Sequence, Dict, List, Tuple
+from typing import Any, Mapping, MutableMapping, Optional, Sequence, Dict, List
 
 from operadic_consistency.core.toq_types import ToQ, NodeId, OpenToQ
 from operadic_consistency.core.interfaces import Answer, Answerer, Collapser, Normalizer, QuestionDecomposer
@@ -69,7 +67,7 @@ def run_consistency_check(
     substituter: Optional[Substituter] = None,
     context: Optional[str] = None,
     plan_opts: Optional[Mapping[str, Any]] = None,
-    cache: Optional[MutableMapping[str, Any]] = None,
+    cache: Optional[MutableMapping[tuple, str]] = None,
 ) -> ConsistencyReport:
     """
     Run the operadic consistency check on a given ToQ:
@@ -185,7 +183,7 @@ def run_consistency_check_from_question(
     substituter: Optional[Substituter] = None,
     context: Optional[str] = None,
     plan_opts: Optional[Mapping[str, Any]] = None,
-    cache: Optional[MutableMapping[str, Any]] = None,
+    cache: Optional[MutableMapping[tuple, str]] = None,
 ) -> ConsistencyReport:
     """
     End-to-end entry point:

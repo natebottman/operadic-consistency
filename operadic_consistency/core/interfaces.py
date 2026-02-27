@@ -23,9 +23,9 @@
 
 # %%
 from dataclasses import dataclass
-from typing import Any, Mapping, MutableMapping, Optional, Sequence, Dict, List, Tuple, Set, Protocol
+from typing import Any, Mapping, Optional, Protocol
 
-from operadic_consistency.core.toq_types import ToQ, NodeId, OpenToQ
+from operadic_consistency.core.toq_types import ToQ, OpenToQ
 
 
 # %%

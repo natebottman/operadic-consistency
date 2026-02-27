@@ -24,7 +24,7 @@
 # %%
 from typing import Any, Dict, Mapping
 
-from operadic_consistency.core.toq_types import ToQ, ToQNode, NodeId, OpenToQ
+from operadic_consistency.core.toq_types import ToQ, ToQNode, NodeId
 
 
 # %%
@@ -32,6 +32,17 @@ def toq_to_json(toq: ToQ) -> Dict[str, Any]:
     """
     Convert a ToQ to a JSON-serializable dict.
     NodeId keys are converted to strings (JSON requirement).
+
+    Example:
+        >>> toq = ToQ(
+        ...     nodes={
+        ...         1: ToQNode(1, "When did WW2 end?", parent=2),
+        ...         2: ToQNode(2, "Who was President at time [A1]?", parent=None),
+        ...     },
+        ...     root_id=2,
+        ... )
+        >>> toq_to_json(toq)
+        {'root_id': 2, 'nodes': {'1': {'id': 1, 'text': 'When did WW2 end?', 'parent': 2}, '2': {'id': 2, 'text': 'Who was President at time [A1]?', 'parent': None}}}
     """
     return {
         "root_id": toq.root_id,
@@ -49,6 +60,28 @@ def toq_to_json(toq: ToQ) -> Dict[str, Any]:
 def toq_from_json(obj: Mapping[str, Any]) -> ToQ:
     """
     Parse a ToQ from a JSON-like dict and validate it.
+
+    Example:
+        >>> raw = {
+        ...     "root_id": 2,
+        ...     "nodes": {
+        ...         "1": {"id": 1, "text": "When did WW2 end?", "parent": 2},
+        ...         "2": {"id": 2, "text": "Who was President at time [A1]?", "parent": None},
+        ...     },
+        ... }
+        >>> toq = toq_from_json(raw)
+        >>> toq.root_id
+        2
+        >>> sorted(toq.nodes)
+        [1, 2]
+        >>> toq.nodes[1].parent
+        2
+
+    Invalid structures raise a ``ValueError``:
+        >>> toq_from_json({"nodes": {}})
+        Traceback (most recent call last):
+        ...
+        ValueError: Invalid ToQ JSON: missing root_id or nodes
     """
     if "root_id" not in obj or "nodes" not in obj:
         raise ValueError("Invalid ToQ JSON: missing root_id or nodes")

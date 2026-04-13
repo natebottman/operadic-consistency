@@ -1,52 +1,11 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python (miniforge)
-#     language: python
-#     name: miniforge-base
-# ---
+import pytest
 
-# %%
-# Dev setup
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
 from operadic_consistency.core.toq_types import ToQ, ToQNode
 from operadic_consistency.core.serialization import toq_to_json, toq_from_json
 
-# %%
-# ---- tests for serialization.py ----
 
-def expect_ok(fn, msg=""):
-    try:
-        fn()
-        print("passed", msg or fn.__name__)
-    except Exception as e:
-        print("FAILED", msg or fn.__name__, "->", type(e).__name__, e)
-
-
-def expect_fail(fn, msg=""):
-    try:
-        fn()
-        print("FAILED (expected failure)", msg or fn.__name__)
-    except Exception as e:
-        print("passed (expected failure)", msg or fn.__name__)
-        print(" ", type(e).__name__, e)
-
-
-def test_roundtrip_simple():
-    nodes = {
-        1: ToQNode(1, "Root?", parent=None),
-    }
-    toq = ToQ(nodes=nodes, root_id=1)
+def test_roundtrip_single_node():
+    toq = ToQ(nodes={1: ToQNode(1, "Root?", parent=None)}, root_id=1)
     toq.validate()
 
     j = toq_to_json(toq)
@@ -58,7 +17,7 @@ def test_roundtrip_simple():
     assert toq2.nodes[1].parent is None
 
 
-def test_roundtrip_nontrivial_tree():
+def test_roundtrip_multi_node():
     nodes = {
         1: ToQNode(1, "Q1?", parent=3),
         2: ToQNode(2, "Q2?", parent=3),
@@ -77,58 +36,34 @@ def test_roundtrip_nontrivial_tree():
         assert toq2.nodes[nid].parent == nodes[nid].parent
 
 
-def test_json_keys_are_strings():
-    nodes = {
-        1: ToQNode(1, "Root?", parent=None),
-    }
-    toq = ToQ(nodes=nodes, root_id=1)
+def test_json_node_keys_are_strings():
+    toq = ToQ(nodes={1: ToQNode(1, "Root?", parent=None)}, root_id=1)
     j = toq_to_json(toq)
-
-    # JSON object keys must be strings
     assert list(j["nodes"].keys()) == ["1"]
 
 
-def test_invalid_missing_fields():
-    bad = {
-        "nodes": {
-            "1": {"id": 1, "text": "Q?", "parent": None}
-        }
-        # missing root_id
-    }
-
-    expect_fail(lambda: toq_from_json(bad), "missing root_id")
+def test_missing_root_id_raises():
+    bad = {"nodes": {"1": {"id": 1, "text": "Q?", "parent": None}}}
+    with pytest.raises(ValueError, match="missing root_id"):
+        toq_from_json(bad)
 
 
-def test_invalid_parent_reference():
+def test_invalid_parent_reference_raises():
     bad = {
         "root_id": 1,
         "nodes": {
             "1": {"id": 1, "text": "Root?", "parent": None},
-            "2": {"id": 2, "text": "Child?", "parent": 99},  # invalid parent
+            "2": {"id": 2, "text": "Child?", "parent": 99},
         },
     }
+    with pytest.raises(ValueError):
+        toq_from_json(bad)
 
-    expect_fail(lambda: toq_from_json(bad), "invalid parent id")
 
-
-def test_node_id_mismatch():
+def test_node_id_mismatch_raises():
     bad = {
         "root_id": 1,
-        "nodes": {
-            "1": {"id": 99, "text": "Q?", "parent": None},
-        },
+        "nodes": {"1": {"id": 99, "text": "Q?", "parent": None}},
     }
-
-    expect_fail(lambda: toq_from_json(bad), "node key != node.id")
-
-
-expect_ok(test_roundtrip_simple, "roundtrip single-node")
-expect_ok(test_roundtrip_nontrivial_tree, "roundtrip multi-node")
-expect_ok(test_json_keys_are_strings, "json keys are strings")
-test_invalid_missing_fields()
-test_invalid_parent_reference()
-test_node_id_mismatch()
-
-print("serialization.py tests done")
-
-# %%
+    with pytest.raises(ValueError):
+        toq_from_json(bad)

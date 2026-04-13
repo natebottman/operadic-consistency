@@ -1,35 +1,11 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python (miniforge)
-#     language: python
-#     name: miniforge-base
-# ---
-
-# %%
 # core/transforms.py
 
-# %%
-# Dev setup
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Dict, List, Mapping, Sequence, Optional, Set, Tuple, FrozenSet
 
 from operadic_consistency.core.toq_types import ToQ, ToQNode, NodeId, OpenToQ
 
-
-# %%
 @dataclass(frozen=True)
 class CollapsePlan:
     cut_edges: tuple[NodeId, ...]
@@ -59,7 +35,6 @@ def enumerate_collapse_plans(
 
     return plans
 
-
 def component_roots(toq: ToQ, plan: CollapsePlan) -> Tuple[NodeId, ...]:
     """
     The cut edges define a partition into components.
@@ -67,7 +42,6 @@ def component_roots(toq: ToQ, plan: CollapsePlan) -> Tuple[NodeId, ...]:
     """
     roots = set(plan.cut_edges) | {toq.root_id}
     return tuple(sorted(roots))
-
 
 def _component_root(toq: ToQ, nid: NodeId, cut: Set[NodeId]) -> NodeId:
     """
@@ -203,5 +177,3 @@ def apply_collapse_plan(
         collapsed_question_by_root=collapsed_question_by_root,
         component_roots=roots,
     )
-
-# %%

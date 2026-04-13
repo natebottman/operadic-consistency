@@ -1,31 +1,8 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python (miniforge)
-#     language: python
-#     name: miniforge-base
-# ---
-
-# %%
 # core/toq_types.py
 
-# %%
-# Dev setup
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
 from typing import Dict, List, Set, Optional, Mapping, Sequence
 from dataclasses import dataclass
 
-# %%
 NodeId = int  # unique identifier for a question node
 
 @dataclass(frozen=True)
@@ -115,5 +92,3 @@ class OpenToQ:
     toq: ToQ
     inputs: tuple[NodeId, ...]
     root_id: NodeId
-
-# %%

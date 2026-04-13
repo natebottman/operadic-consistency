@@ -22,4 +22,4 @@ include = ["operadic_consistency*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--xdoctest"
+addopts = ""

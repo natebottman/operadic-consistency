@@ -1,35 +1,11 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python (miniforge)
-#     language: python
-#     name: miniforge-base
-# ---
-
-# %%
 # core/evaluate.py
 
-# %%
-# Dev setup
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional, Protocol, List
 
 from operadic_consistency.core.toq_types import ToQ, NodeId
 from operadic_consistency.core.interfaces import Answer, Answerer
 
-
-# %%
 @dataclass(frozen=True)
 class EvalTrace:
     rendered_question: Mapping[NodeId, str]
@@ -38,12 +14,10 @@ class EvalTrace:
     answer: Mapping[NodeId, Answer]
     # Model answers at each node
 
-
 class Substituter(Protocol):
     def __call__(self, template: str, child_answers: Mapping[NodeId, str]) -> str:
         # Combine child answers into the parent question template
         ...
-
 
 def default_substituter(template: str, child_answers: Mapping[NodeId, str]) -> str:
     """
@@ -54,7 +28,6 @@ def default_substituter(template: str, child_answers: Mapping[NodeId, str]) -> s
     for cid, ans in child_answers.items():
         out = out.replace(f"[A{cid}]", ans)
     return out
-
 
 def _postorder(toq: ToQ) -> List[NodeId]:
     """Return node ids in postorder (children before parent), starting at root."""
@@ -72,7 +45,6 @@ def _postorder(toq: ToQ) -> List[NodeId]:
 
     dfs(toq.root_id)
     return order
-
 
 def evaluate_toq(
     toq: ToQ,
@@ -113,5 +85,3 @@ def evaluate_toq(
         answers[nid] = answerer(q, context=context)
 
     return EvalTrace(rendered_question=rendered, answer=answers)
-
-# %%

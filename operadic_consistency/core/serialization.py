@@ -1,33 +1,9 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python (miniforge)
-#     language: python
-#     name: miniforge-base
-# ---
-
-# %%
 # core/serialization.py
 
-# %%
-# Dev setup
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
 from typing import Any, Dict, Mapping
 
 from operadic_consistency.core.toq_types import ToQ, ToQNode, NodeId
 
-
-# %%
 def toq_to_json(toq: ToQ) -> Dict[str, Any]:
     """
     Convert a ToQ to a JSON-serializable dict.
@@ -55,7 +31,6 @@ def toq_to_json(toq: ToQ) -> Dict[str, Any]:
             for nid, node in toq.nodes.items()
         },
     }
-
 
 def toq_from_json(obj: Mapping[str, Any]) -> ToQ:
     """
@@ -115,5 +90,3 @@ def toq_from_json(obj: Mapping[str, Any]) -> ToQ:
     toq = ToQ(nodes=nodes, root_id=obj["root_id"])
     toq.validate()
     return toq
-
-# %%

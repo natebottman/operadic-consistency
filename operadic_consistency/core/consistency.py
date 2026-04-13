@@ -1,27 +1,5 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python (miniforge)
-#     language: python
-#     name: miniforge-base
-# ---
-
-# %%
 # core/consistency.py
 
-# %%
-# Dev setup
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping, Optional, Sequence, Dict, List
 
@@ -37,8 +15,6 @@ from operadic_consistency.core.transforms import (
 )
 from operadic_consistency.core.evaluate import EvalTrace, Substituter, evaluate_toq
 
-
-# %%
 @dataclass(frozen=True)
 class RunRecord:
     plan: CollapsePlan
@@ -48,7 +24,6 @@ class RunRecord:
     normalized_root: Optional[str]
     # Result of evaluating one partial-collapse variant
 
-
 @dataclass(frozen=True)
 class ConsistencyReport:
     base_trace: EvalTrace
@@ -56,7 +31,6 @@ class ConsistencyReport:
     runs: Sequence[RunRecord]
     summary: Mapping[str, Any]
     # Full results of the consistency check
-
 
 def run_consistency_check(
     toq: ToQ,
@@ -203,5 +177,3 @@ def run_consistency_check_from_question(
         plan_opts=plan_opts,
         cache=cache,
     )
-
-# %%

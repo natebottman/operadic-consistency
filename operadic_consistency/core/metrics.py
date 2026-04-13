@@ -1,27 +1,5 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python (miniforge)
-#     language: python
-#     name: miniforge-base
-# ---
-
-# %%
 #core/metrics.py
 
-# %%
-# Dev setup
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
 from collections import Counter
 from math import log
 from typing import Any, Dict, Mapping, Sequence, Tuple, List, Optional
@@ -29,8 +7,6 @@ from typing import Any, Dict, Mapping, Sequence, Tuple, List, Optional
 from operadic_consistency.core.consistency import ConsistencyReport
 from operadic_consistency.core.transforms import CollapsePlan
 
-
-# %%
 def _answer_key(text: str) -> str:
     # Default fallback key if no normalizer is used; keep simple.
     return text
@@ -153,5 +129,3 @@ def summarize_report(
         "top_answers": top,
         "witness_plans": {k: [p.cut_edges for p in ps] for k, ps in witnesses.items()},
     }
-
-# %%

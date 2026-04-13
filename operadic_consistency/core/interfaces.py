@@ -1,34 +1,10 @@
-# ---
-# jupyter:
-#   jupytext:
-#     formats: ipynb,py:percent
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python (miniforge)
-#     language: python
-#     name: miniforge-base
-# ---
-
-# %%
 # core/interfaces.py
 
-# %%
-# Dev setup
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol
 
 from operadic_consistency.core.toq_types import ToQ, OpenToQ
 
-
-# %%
 @dataclass(frozen=True)
 class Answer:
     text: str
@@ -57,5 +33,3 @@ class QuestionDecomposer(Protocol):
         Given a raw question, return a validated ToQ decomposition.
         """
         ...
-
-# %%

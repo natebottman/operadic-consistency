@@ -261,17 +261,40 @@ repository.
 
 ### Usage
 
+There is no registration system.  You write a small driver script, run it
+from the command line, and point it at your HELM output directory.  The
+`RunPredictor.__call__` method (inherited from MAGNET) handles loading the
+HELM runs, partitioning them into training and test splits, and calling
+`predict()`.
+
 ```python
+# run_predictor.py
 from operadic_consistency.magnet import OperadicConsistencyPredictor
 
 predictor = OperadicConsistencyPredictor(
     answerer_model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
     together_api_key="YOUR_KEY",
     n_consistency_samples=20,
+    num_example_runs=5,   # number of training runs (with known accuracy)
+    num_eval_samples=20,  # instances sampled per run for consistency estimation
 )
-# predictor.predict(train_split, sequestered_test_split) is called by the
-# MAGNET harness automatically.
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("suite_path", help="Path to HELM benchmark_output/runs/<suite>")
+    args = parser.parse_args()
+    predictor(args.suite_path)
 ```
+
+```bash
+python run_predictor.py path/to/benchmark_output/runs/my_suite
+```
+
+`train_split` receives the runs for which MAGNET has ground-truth accuracy
+stats; `sequestered_test_split` receives the remaining runs with stats withheld.
+The predictor fits the calibration from the former and emits `RunPrediction`
+objects for the latter.
 
 ## Docs
 

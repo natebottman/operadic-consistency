@@ -270,10 +270,11 @@ def _extract_questions_and_answers(df) -> tuple[list[str], list[str]]:
 class _LinearCalibration:
     """Simple linear map: accuracy ≈ slope * consistency + intercept."""
 
-    # Prior from our empirical data: across 10+ models on HotpotQA/MuSiQue/DROP,
-    # consistency ≈ 0.55 predicts accuracy ≈ 0.60 (slope ~0.7, intercept ~0.22).
-    PRIOR_SLOPE = 0.70
-    PRIOR_INTERCEPT = 0.22
+    # Prior fit from 11 models on MuSiQue (Pearson r = 0.93):
+    #   accuracy ≈ 1.038 * consistency - 0.039
+    # Range of observed consistency: 0.09–0.27; accuracy: 0.06–0.24.
+    PRIOR_SLOPE = 1.038
+    PRIOR_INTERCEPT = -0.039
 
     def __init__(self, slope: float = PRIOR_SLOPE, intercept: float = PRIOR_INTERCEPT):
         self.slope = slope

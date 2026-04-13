@@ -16,11 +16,10 @@ Algorithm
      compose to get the root answer.
 3. **Consistency score**: Fraction of instances where direct ≈ expansion
    (token-F1 ≥ threshold).
-4. **Calibration**: Fit a linear model (consistency → accuracy) using the
-   training runs, which have both consistency scores (computed here) and
-   ground-truth accuracy (provided by MAGNET's ``train_split.stats``).
-   If fewer than 2 training runs are available, falls back to the identity
-   mapping (accuracy ≈ consistency).
+4. **Calibration**: Fit a consistency → accuracy mapping using training runs,
+   which have both consistency scores (computed here) and ground-truth accuracy
+   (from MAGNET's ``train_split.stats``).  With 2+ runs: affine OLS.
+   With 1 run: linear through the origin.  With 0 runs: identity.
 5. **Predict**: Apply the calibration to each test run's consistency score.
 
 Two groups of models
@@ -281,15 +280,12 @@ def _extract_questions_and_answers(df) -> tuple[list[str], list[str]]:
 
 class _LinearCalibration:
     """
-    Linear map: accuracy ≈ slope * consistency + intercept.
-
-    Fitted from (consistency, accuracy) pairs drawn from training runs:
+    Calibration from (consistency, accuracy) pairs drawn from training runs:
 
     - 0 points: identity (accuracy = consistency).
-    - 1 point:  slope=1, intercept chosen so the line passes through the
-                single training point.  This honors the one anchor we have
-                without trying to estimate the slope from a single observation.
-    - 2+ points: OLS fit with intercept.
+    - 1 point:  linear through the origin -- slope = accuracy / consistency,
+                intercept = 0.
+    - 2+ points: affine OLS fit (slope and intercept both free).
     """
 
     def __init__(self, slope: float = 1.0, intercept: float = 0.0):
@@ -307,24 +303,19 @@ class _LinearCalibration:
             return cls(slope=1.0, intercept=0.0)
 
         if n == 1:
-            # Slope=1, intercept passes through the single point.
-            intercept = accuracies[0] - consistencies[0]
-            log.warning(
-                "Only 1 training run; using slope=1, intercept=%.3f "
-                "(line through single point).",
-                intercept,
-            )
-            cal = cls(slope=1.0, intercept=float(intercept))
+            c, a = consistencies[0], accuracies[0]
+            slope = a / c if c != 0.0 else 1.0
+            log.warning("Only 1 training run; using slope=%.3f, intercept=0.", slope)
+            cal = cls(slope=float(slope), intercept=0.0)
             cal.n_points = 1
             return cal
 
-        x = np.array(consistencies)
-        y = np.array(accuracies)
+        x = np.array(consistencies, dtype=float)
+        y = np.array(accuracies, dtype=float)
 
-        # OLS with intercept
+        # Affine OLS: minimise sum((y - slope*x - intercept)^2)
         A = np.column_stack([x, np.ones_like(x)])
-        result = np.linalg.lstsq(A, y, rcond=None)
-        slope, intercept = result[0]
+        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
 
         cal = cls(slope=float(slope), intercept=float(intercept))
         cal.n_points = n

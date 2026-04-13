@@ -246,9 +246,9 @@ The caller specifies two groups of models:
   are available.  The predictor computes consistency and maps it to a predicted
   accuracy via the fitted calibration.
 
-If only 1 training run is available, the predictor uses slope=1 with an
-intercept chosen so the line passes through that point.  If no training runs
-are available, it falls back to the identity (predicted accuracy = consistency).
+With 1 training run the predictor uses a linear-through-the-origin fit
+(slope = accuracy / consistency, intercept = 0).  With 0 training runs it
+falls back to the identity (predicted accuracy = consistency).
 
 ### Install
 

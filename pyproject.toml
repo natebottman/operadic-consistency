@@ -13,7 +13,12 @@ dependencies = []
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "xdoctest>=1.1.0",
+    "numpy>=1.24",
+]
+magnet = [
+    "numpy>=1.24",
+    "together>=1.3",
+    "magnet @ git+https://github.com/AIQ-Kitware/aiq-magnet.git",
 ]
 
 [tool.setuptools.packages.find]

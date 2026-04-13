@@ -283,35 +283,40 @@ class _LinearCalibration:
     """
     Linear map: accuracy ≈ slope * consistency + intercept.
 
-    Fitted via OLS from (consistency, accuracy) pairs drawn from training runs.
-    Falls back to the identity mapping (slope=1, intercept=0) when fewer than
-    2 training points are available — i.e., "predict accuracy = consistency" as
-    a neutral, assumption-free default.
+    Fitted from (consistency, accuracy) pairs drawn from training runs:
+
+    - 0 points: identity (accuracy = consistency).
+    - 1 point:  slope=1, intercept chosen so the line passes through the
+                single training point.  This honors the one anchor we have
+                without trying to estimate the slope from a single observation.
+    - 2+ points: OLS fit with intercept.
     """
 
-    # Uninformative fallback: accuracy ≈ consistency
-    _FALLBACK_SLOPE = 1.0
-    _FALLBACK_INTERCEPT = 0.0
-
-    def __init__(self, slope: float = _FALLBACK_SLOPE, intercept: float = _FALLBACK_INTERCEPT):
+    def __init__(self, slope: float = 1.0, intercept: float = 0.0):
         self.slope = slope
         self.intercept = intercept
         self.n_points = 0
 
     @classmethod
     def fit(cls, consistencies: list[float], accuracies: list[float]) -> "_LinearCalibration":
-        """
-        Fit from (consistency, accuracy) pairs via OLS.
+        """Fit from (consistency, accuracy) pairs; see class docstring for fallback rules."""
+        n = len(consistencies)
 
-        Falls back to the identity mapping if fewer than 2 points are provided.
-        """
-        if len(consistencies) < 2:
+        if n == 0:
+            log.warning("No training runs available; falling back to identity (accuracy = consistency).")
+            return cls(slope=1.0, intercept=0.0)
+
+        if n == 1:
+            # Slope=1, intercept passes through the single point.
+            intercept = accuracies[0] - consistencies[0]
             log.warning(
-                "Too few training runs (%d) to fit calibration; "
-                "falling back to identity (accuracy = consistency).",
-                len(consistencies),
+                "Only 1 training run; using slope=1, intercept=%.3f "
+                "(line through single point).",
+                intercept,
             )
-            return cls()
+            cal = cls(slope=1.0, intercept=float(intercept))
+            cal.n_points = 1
+            return cal
 
         x = np.array(consistencies)
         y = np.array(accuracies)
@@ -322,7 +327,7 @@ class _LinearCalibration:
         slope, intercept = result[0]
 
         cal = cls(slope=float(slope), intercept=float(intercept))
-        cal.n_points = len(consistencies)
+        cal.n_points = n
         return cal
 
     def predict(self, consistency: float) -> float:

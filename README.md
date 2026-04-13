@@ -232,8 +232,8 @@ implements the MAGNET `RunPredictor` interface for the DARPA AIQ TA2 evaluation.
 
 ### Idea
 
-Operadic consistency — whether a model's direct answer to a question agrees
-with the answer it reaches by first answering sub-questions — correlates
+Operadic consistency -- whether a model's direct answer to a question agrees
+with the answer it reaches by first answering sub-questions -- correlates
 strongly with accuracy.  The predictor exploits this to estimate accuracy on
 models whose ground-truth labels are held out.
 
@@ -246,8 +246,9 @@ The caller specifies two groups of models:
   are available.  The predictor computes consistency and maps it to a predicted
   accuracy via the fitted calibration.
 
-If fewer than 2 training runs are available, the predictor falls back to the
-identity mapping (predicted accuracy = consistency rate).
+If only 1 training run is available, the predictor uses slope=1 with an
+intercept chosen so the line passes through that point.  If no training runs
+are available, it falls back to the identity (predicted accuracy = consistency).
 
 ### Install
 

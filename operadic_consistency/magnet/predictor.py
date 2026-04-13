@@ -16,10 +16,22 @@ Algorithm
      compose to get the root answer.
 3. **Consistency score**: Fraction of instances where direct ≈ expansion
    (token-F1 ≥ threshold).
-4. **Calibration**: Fit a linear model (consistency → accuracy) using training
-   runs that have both consistency and ground-truth accuracy.  Fall back to a
-   pre-fitted intercept if training data is unavailable.
-5. **Predict**: Apply the calibration model to the test run's consistency score.
+4. **Calibration**: Fit a linear model (consistency → accuracy) using the
+   training runs, which have both consistency scores (computed here) and
+   ground-truth accuracy (provided by MAGNET's ``train_split.stats``).
+   If fewer than 2 training runs are available, falls back to the identity
+   mapping (accuracy ≈ consistency).
+5. **Predict**: Apply the calibration to each test run's consistency score.
+
+Two groups of models
+--------------------
+The MAGNET interface cleanly separates the two groups the caller provides:
+
+- **Training runs** (``train_split``): models for which ground-truth accuracy
+  is available.  These are used to fit the consistency → accuracy mapping.
+- **Test runs** (``sequestered_test_split``): models for which only raw
+  outputs are available.  Consistency is computed and mapped to a predicted
+  accuracy via the fitted calibration.
 
 Usage
 -----
@@ -268,25 +280,37 @@ def _extract_questions_and_answers(df) -> tuple[list[str], list[str]]:
 # ── Linear calibration ────────────────────────────────────────────────────────
 
 class _LinearCalibration:
-    """Simple linear map: accuracy ≈ slope * consistency + intercept."""
+    """
+    Linear map: accuracy ≈ slope * consistency + intercept.
 
-    # Prior fit from 11 models on MuSiQue (Pearson r = 0.93):
-    #   accuracy ≈ 1.038 * consistency - 0.039
-    # Range of observed consistency: 0.09–0.27; accuracy: 0.06–0.24.
-    PRIOR_SLOPE = 1.038
-    PRIOR_INTERCEPT = -0.039
+    Fitted via OLS from (consistency, accuracy) pairs drawn from training runs.
+    Falls back to the identity mapping (slope=1, intercept=0) when fewer than
+    2 training points are available — i.e., "predict accuracy = consistency" as
+    a neutral, assumption-free default.
+    """
 
-    def __init__(self, slope: float = PRIOR_SLOPE, intercept: float = PRIOR_INTERCEPT):
+    # Uninformative fallback: accuracy ≈ consistency
+    _FALLBACK_SLOPE = 1.0
+    _FALLBACK_INTERCEPT = 0.0
+
+    def __init__(self, slope: float = _FALLBACK_SLOPE, intercept: float = _FALLBACK_INTERCEPT):
         self.slope = slope
         self.intercept = intercept
         self.n_points = 0
 
     @classmethod
     def fit(cls, consistencies: list[float], accuracies: list[float]) -> "_LinearCalibration":
-        """Fit from (consistency, accuracy) pairs. Falls back to prior if too few points."""
+        """
+        Fit from (consistency, accuracy) pairs via OLS.
+
+        Falls back to the identity mapping if fewer than 2 points are provided.
+        """
         if len(consistencies) < 2:
-            log.info("Too few training points (%d) for calibration; using prior.",
-                     len(consistencies))
+            log.warning(
+                "Too few training runs (%d) to fit calibration; "
+                "falling back to identity (accuracy = consistency).",
+                len(consistencies),
+            )
             return cls()
 
         x = np.array(consistencies)

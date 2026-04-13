@@ -12,7 +12,10 @@ the final answer.
 
 ```text
 .
-├── operadic_consistency/   # importable package code
+├── operadic_consistency/
+│   ├── core/               # ToQ types, evaluation, metrics, serialization
+│   ├── magnet/             # DARPA AIQ MAGNET predictor (optional)
+│   └── model_interface/    # LLM decomposer/answerer wrappers
 ├── tests/                  # pytest suite
 ├── docs/                   # usage docs
 ├── examples/               # runnable examples
@@ -220,6 +223,53 @@ Run minimal example:
 
 ```bash
 python examples/minimal_consistency.py
+```
+
+## MAGNET Integration (DARPA AIQ)
+
+`operadic_consistency.magnet` provides an `OperadicConsistencyPredictor` that
+implements the MAGNET `RunPredictor` interface for the DARPA AIQ TA2 evaluation.
+
+### Idea
+
+Operadic consistency — whether a model's direct answer to a question agrees
+with the answer it reaches by first answering sub-questions — correlates
+strongly with accuracy.  The predictor exploits this to estimate accuracy on
+models whose ground-truth labels are held out.
+
+The caller specifies two groups of models:
+
+- **Training runs** (`train_split`): models for which ground-truth accuracy is
+  available.  The predictor computes operadic consistency for each, then fits a
+  linear consistency → accuracy calibration from these pairs.
+- **Test runs** (`sequestered_test_split`): models for which only raw outputs
+  are available.  The predictor computes consistency and maps it to a predicted
+  accuracy via the fitted calibration.
+
+If fewer than 2 training runs are available, the predictor falls back to the
+identity mapping (predicted accuracy = consistency rate).
+
+### Install
+
+```bash
+pip install -e ".[magnet]"
+```
+
+This installs `together` (for LLM calls) and `magnet` from the AIQ-Kitware
+repository.
+
+### Usage
+
+```python
+from operadic_consistency.magnet import OperadicConsistencyPredictor
+
+predictor = OperadicConsistencyPredictor(
+    answerer_model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+    together_api_key="YOUR_KEY",
+    n_consistency_samples=20,
+)
+# predictor.predict(train_split, sequestered_test_split) is called by the
+# MAGNET harness automatically.
 ```
 
 ## Docs

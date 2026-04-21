@@ -66,7 +66,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -470,16 +470,36 @@ class OperadicConsistencyPredictor(RunPredictor):
     objects, so the TA2 harness can substitute its own inference setup
     (e.g. a vllm server) without touching this class.
 
+    Per-run vs fixed answerer
+    -------------------------
+    Consistency of a model X is, strictly speaking, a within-X property:
+    "does X's factored answer match X's direct answer?" That means the
+    answerer backend should match the model that produced each run's direct
+    answers. Pass ``answerer_factory`` to enable per-run answerer resolution;
+    the factory is called with the model ID extracted from each run's
+    ``run_spec.name`` and should return an ``LLMBackend`` bound to that model.
+
+    If no factory is given, the predictor falls back to the single
+    ``answerer`` backend for every run (backward compatible — but note this
+    mixes models, so the resulting signal is really "does X's direct answer
+    match some reference model's factored answer," not pure self-consistency).
+
     Parameters
     ----------
     answerer:
-        ``LLMBackend`` used to answer sub-questions during consistency
-        expansion. If omitted, ``answerer_model`` + ``together_api_key``
-        must be provided; a ``TogetherBackend`` will be constructed for
-        backward compatibility.
+        Default ``LLMBackend`` used to answer sub-questions when no
+        ``answerer_factory`` is provided. Can be ``None`` if a factory is
+        supplied.
     decomposer:
         ``LLMBackend`` used to decompose questions into sub-questions.
-        Defaults to ``answerer`` if omitted.
+        Defaults to ``answerer`` if omitted. Always fixed across runs —
+        the decomposer is part of the evaluation methodology, not the thing
+        being evaluated.
+    answerer_factory:
+        Optional ``Callable[[str], LLMBackend]``. If given, called once per
+        run with the model ID extracted from ``run_spec.name`` and expected
+        to return a backend bound to that model. Enables per-run
+        self-consistency evaluation.
     answerer_model, together_api_key, decomposer_model:
         Legacy kwargs. Provide these to auto-construct ``TogetherBackend``
         instances. Ignored if ``answerer`` is passed explicitly.
@@ -506,6 +526,7 @@ class OperadicConsistencyPredictor(RunPredictor):
         answerer: Optional[LLMBackend] = None,
         decomposer: Optional[LLMBackend] = None,
         *,
+        answerer_factory: Optional[Callable[[str], LLMBackend]] = None,
         answerer_model: Optional[str] = None,
         together_api_key: Optional[str] = None,
         decomposer_model: Optional[str] = None,
@@ -523,25 +544,36 @@ class OperadicConsistencyPredictor(RunPredictor):
             random_seed=random_seed,
         )
 
-        # Resolve backends. Prefer explicit backend objects; fall back to the
-        # legacy (model, api_key) kwargs by auto-wrapping in TogetherBackend.
-        if answerer is None:
-            if answerer_model is None or together_api_key is None:
-                raise ValueError(
-                    "Must provide either `answerer` (LLMBackend) or both "
-                    "`answerer_model` and `together_api_key`."
-                )
+        # Resolve default answerer. Prefer explicit backend; fall back to
+        # legacy (model, api_key) kwargs. If neither is given AND a factory
+        # is provided, the default answerer stays None and every run must
+        # route through the factory.
+        if answerer is None and answerer_model is not None and together_api_key is not None:
             answerer = TogetherBackend(model=answerer_model, api_key=together_api_key)
 
+        if answerer is None and answerer_factory is None:
+            raise ValueError(
+                "Must provide at least one of: `answerer`, `answerer_factory`, "
+                "or `(answerer_model, together_api_key)`."
+            )
+
+        # Resolve decomposer. It stays fixed across runs.
         if decomposer is None:
             if decomposer_model is not None and together_api_key is not None:
                 decomposer = TogetherBackend(
                     model=decomposer_model, api_key=together_api_key
                 )
+            elif answerer is not None:
+                decomposer = answerer  # default: reuse default answerer
             else:
-                decomposer = answerer  # default: reuse answerer
+                raise ValueError(
+                    "Cannot default decomposer to answerer when only "
+                    "`answerer_factory` is provided — pass `decomposer` "
+                    "(or `decomposer_model` + `together_api_key`) explicitly."
+                )
 
-        self.answerer: LLMBackend = answerer
+        self.answerer: Optional[LLMBackend] = answerer
+        self.answerer_factory: Optional[Callable[[str], LLMBackend]] = answerer_factory
         self.decomposer: LLMBackend = decomposer
         self.stat_name = stat_name
         self.stat_split = stat_split
@@ -552,6 +584,51 @@ class OperadicConsistencyPredictor(RunPredictor):
         self.random_seed = random_seed
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    # ── Per-run model resolution ──────────────────────────────────────────────
+
+    _MODEL_RE = re.compile(r"model=([^,\s]+)")
+
+    def _extract_model_id(self, run_spec_name: str) -> str:
+        """Extract the model ID from a HELM ``run_spec.name``.
+
+        HELM convention: ``<scenario>:model=<model_id>,key2=value2,...``.
+        Override this in a subclass for non-HELM naming conventions.
+        """
+        m = self._MODEL_RE.search(run_spec_name)
+        return m.group(1).strip() if m else "unknown-model"
+
+    def _answerer_for_run(self, run_spec_name: str) -> tuple[LLMBackend, str]:
+        """Resolve (answerer_backend, answerer_model_id) for a given run.
+
+        - If ``answerer_factory`` is set, calls ``factory(model_id)`` where
+          ``model_id`` comes from :meth:`_extract_model_id`. This is the
+          per-run self-consistency path.
+        - Otherwise falls back to the default ``self.answerer`` and reports
+          its own ``.model`` attribute (the legacy fixed-answerer path).
+        """
+        if self.answerer_factory is not None:
+            model_id = self._extract_model_id(run_spec_name)
+            return self.answerer_factory(model_id), model_id
+        if self.answerer is None:
+            raise RuntimeError(
+                f"No answerer available for run '{run_spec_name}': "
+                "neither an `answerer` nor an `answerer_factory` is configured."
+            )
+        return self.answerer, getattr(self.answerer, "model", "unknown-model")
+
+    def _answerer_model_for_run(self, run_spec_name: str) -> str:
+        """Return just the answerer model ID for a run (no backend construction).
+
+        Used by the batched path to populate ``InferenceRequest.model``.
+        """
+        if self.answerer_factory is not None:
+            return self._extract_model_id(run_spec_name)
+        if self.answerer is not None:
+            return getattr(self.answerer, "model", "unknown-model")
+        raise RuntimeError(
+            f"No answerer configured for run '{run_spec_name}'."
+        )
 
     def _sampled_questions(self, scenario_df) -> tuple[list[str], list[str]]:
         """Deterministically sample ``n_consistency_samples`` questions from a run.
@@ -570,32 +647,29 @@ class OperadicConsistencyPredictor(RunPredictor):
         idx = rng.choice(len(questions), size=n, replace=False)
         return [questions[i] for i in idx], [directs[i] for i in idx]
 
-    def _consistency_for_df(self, scenario_df) -> float:
-        """Compute consistency rate for a scenario_state DataFrame (dynamic path)."""
+    def _consistency_for_run(self, run_spec_name: str, scenario_df) -> float:
+        """Compute consistency rate for one run (dynamic path).
+
+        Uses :meth:`_answerer_for_run` so a per-run answerer backend is picked
+        up when ``answerer_factory`` is configured. Otherwise falls back to
+        the default fixed answerer.
+        """
         questions, directs = self._sampled_questions(scenario_df)
         if not questions:
-            log.warning("No questions extracted from scenario_state.")
+            log.warning("No questions extracted from scenario_state for '%s'.", run_spec_name)
             return 0.0
+
+        answerer, _ = self._answerer_for_run(run_spec_name)
 
         return compute_consistency_for_run(
             questions=questions,
             direct_answers=directs,
-            answerer=self.answerer,
+            answerer=answerer,
             decomposer=self.decomposer,
             f1_threshold=self.f1_threshold,
         )
 
     # ── Batched inference path ────────────────────────────────────────────────
-
-    def _iter_all_runs(self, train_split, sequestered_test_split):
-        """Yield (run_name, sampled_questions, sampled_directs) for every run
-        in both splits, using the same deterministic sampling as the dynamic path."""
-        for run_name, grp in train_split.scenario_state.groupby("run_spec.name"):
-            qs, ds = self._sampled_questions(grp)
-            yield run_name, qs, ds
-        for run_name, grp in sequestered_test_split.scenario_state.groupby("run_spec.name"):
-            qs, ds = self._sampled_questions(grp)
-            yield run_name, qs, ds
 
     def plan_next_batch(
         self,
@@ -607,26 +681,37 @@ class OperadicConsistencyPredictor(RunPredictor):
 
         The batched flow has up to three sequential phases:
 
-        1. **Decompose** each sampled question (decomposer model).
-        2. **Answer Q1** for each successful decomposition (answerer model).
-        3. **Answer Q2** with ``[A1]`` filled from the cached Q1 result.
+        1. **Decompose** each sampled question (decomposer model — fixed).
+        2. **Answer Q1** for each successful decomposition, using the
+           *per-run* answerer model (whichever model produced that run's
+           direct answers).
+        3. **Answer Q2** with ``[A1]`` filled from the cached Q1 result,
+           also using the per-run answerer model.
 
         The caller is expected to execute each returned batch, merge the
         results into ``cache`` (``{request_id: completion_text}``), and call
         this method again until it returns ``[]``.
 
-        Requests are deduplicated by ``request_id`` so asking the same
-        (role, model, prompt) triple twice — e.g. the same question appearing
-        in multiple runs — only costs one inference call.
+        Requests are deduplicated by ``request_id`` (a hash of
+        ``(role, model, prompt)``) so asking the same triple twice — e.g.
+        two runs that happen to use the same answerer model — only costs
+        one inference call.
         """
         decomposer_model = getattr(self.decomposer, "model", "unknown-decomposer")
-        answerer_model = getattr(self.answerer, "model", "unknown-answerer")
 
-        runs = list(self._iter_all_runs(train_split, sequestered_test_split))
+        # Enumerate (run_name, questions, answerer_model) once so we can
+        # resolve per-run answerer models without repeating work.
+        runs_with_models = []
+        for run_name, grp in train_split.scenario_state.groupby("run_spec.name"):
+            qs, _ = self._sampled_questions(grp)
+            runs_with_models.append((run_name, qs, self._answerer_model_for_run(run_name)))
+        for run_name, grp in sequestered_test_split.scenario_state.groupby("run_spec.name"):
+            qs, _ = self._sampled_questions(grp)
+            runs_with_models.append((run_name, qs, self._answerer_model_for_run(run_name)))
 
-        # ── Phase 1: decomposition ────────────────────────────────────────────
+        # ── Phase 1: decomposition (fixed decomposer; dedup by question) ──────
         decompose_reqs: dict[str, InferenceRequest] = {}
-        for _, questions, _ in runs:
+        for _, questions, _ in runs_with_models:
             for q in questions:
                 req = _make_decompose_request(q, decomposer_model)
                 if req.request_id not in cache:
@@ -634,9 +719,9 @@ class OperadicConsistencyPredictor(RunPredictor):
         if decompose_reqs:
             return list(decompose_reqs.values())
 
-        # ── Phase 2: answer Q1 ────────────────────────────────────────────────
+        # ── Phase 2: answer Q1 (per-run answerer model) ───────────────────────
         q1_reqs: dict[str, InferenceRequest] = {}
-        for _, questions, _ in runs:
+        for _, questions, answerer_model in runs_with_models:
             for q in questions:
                 decomp_req = _make_decompose_request(q, decomposer_model)
                 decomp = _parse_decomposition(cache.get(decomp_req.request_id, ""))
@@ -649,9 +734,9 @@ class OperadicConsistencyPredictor(RunPredictor):
         if q1_reqs:
             return list(q1_reqs.values())
 
-        # ── Phase 3: answer Q2 (with [A1] substituted) ────────────────────────
+        # ── Phase 3: answer Q2 with [A1] substituted (per-run answerer) ───────
         q2_reqs: dict[str, InferenceRequest] = {}
-        for _, questions, _ in runs:
+        for _, questions, answerer_model in runs_with_models:
             for q in questions:
                 decomp_req = _make_decompose_request(q, decomposer_model)
                 decomp = _parse_decomposition(cache.get(decomp_req.request_id, ""))
@@ -684,7 +769,6 @@ class OperadicConsistencyPredictor(RunPredictor):
         returned requests have been executed by the harness.
         """
         decomposer_model = getattr(self.decomposer, "model", "unknown-decomposer")
-        answerer_model = getattr(self.answerer, "model", "unknown-answerer")
 
         # ── Step 1: calibrate from training runs ─────────────────────────────
         consistencies: list[float] = []
@@ -693,6 +777,7 @@ class OperadicConsistencyPredictor(RunPredictor):
         for run_spec_name, grp in train_split.scenario_state.groupby("run_spec.name"):
             log.info("Reading cached consistency for training run: %s", run_spec_name)
             questions, directs = self._sampled_questions(grp)
+            answerer_model = self._answerer_model_for_run(run_spec_name)
             consistency = _consistency_from_cache(
                 questions=questions,
                 direct_answers=directs,
@@ -719,6 +804,7 @@ class OperadicConsistencyPredictor(RunPredictor):
             "run_spec.name"
         ):
             questions, directs = self._sampled_questions(grp)
+            answerer_model = self._answerer_model_for_run(run_spec_name)
             consistency = _consistency_from_cache(
                 questions=questions,
                 direct_answers=directs,
@@ -786,7 +872,7 @@ class OperadicConsistencyPredictor(RunPredictor):
 
         for run_spec_name, grp in train_split.scenario_state.groupby("run_spec.name"):
             log.info("Computing consistency for training run: %s", run_spec_name)
-            consistency = self._consistency_for_df(grp)
+            consistency = self._consistency_for_run(run_spec_name, grp)
             accuracy = self._accuracy_from_stats(train_split.stats, run_spec_name)
 
             if accuracy is not None:
@@ -807,7 +893,7 @@ class OperadicConsistencyPredictor(RunPredictor):
             "run_spec.name"
         ):
             log.info("Computing consistency for test run: %s", run_spec_name)
-            consistency = self._consistency_for_df(grp)
+            consistency = self._consistency_for_run(run_spec_name, grp)
             predicted_accuracy = calibration.predict(consistency)
             log.info(
                 "  consistency=%.3f  predicted_accuracy=%.3f",

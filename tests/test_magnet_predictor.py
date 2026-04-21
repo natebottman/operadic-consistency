@@ -376,3 +376,138 @@ def test_predict_from_cache_produces_predictions():
     for p in predictions:
         assert 0.0 <= p.mean <= 1.0
         assert p.stat_name == "exact_match"
+
+
+# ── Per-run answerer resolution ───────────────────────────────────────────────
+
+def test_extract_model_id_parses_helm_run_spec():
+    """HELM run_spec names look like 'scenario:model=<id>,key=value,...'."""
+    pred = OperadicConsistencyPredictor(
+        answerer=TogetherBackend(model="fallback", api_key="sk-dummy"),
+    )
+    assert pred._extract_model_id(
+        "natural_qa:model=meta-llama/Llama-3.1-8B,num_shots=5"
+    ) == "meta-llama/Llama-3.1-8B"
+    assert pred._extract_model_id(
+        "gsm8k:model=qwen/Qwen-2.5-7B-Instruct,thinking=true"
+    ) == "qwen/Qwen-2.5-7B-Instruct"
+
+
+def test_extract_model_id_unparseable_falls_back():
+    """If nothing matches 'model=...', extractor returns a sentinel."""
+    pred = OperadicConsistencyPredictor(
+        answerer=TogetherBackend(model="fallback", api_key="sk-dummy"),
+    )
+    assert pred._extract_model_id("no-model-here") == "unknown-model"
+
+
+def test_answerer_factory_invoked_per_run():
+    """With a factory set, the predictor resolves a fresh backend per run."""
+    seen_model_ids: list[str] = []
+
+    def factory(model_id: str) -> LLMBackend:
+        seen_model_ids.append(model_id)
+        return TogetherBackend(model=model_id, api_key="sk-dummy")
+
+    pred = OperadicConsistencyPredictor(
+        answerer_factory=factory,
+        decomposer=TogetherBackend(model="fixed-decomposer", api_key="sk-dummy"),
+    )
+
+    _, id_a = pred._answerer_for_run("qa:model=foo-model,k=v")
+    _, id_b = pred._answerer_for_run("qa:model=bar-model,k=v")
+    assert id_a == "foo-model"
+    assert id_b == "bar-model"
+    assert seen_model_ids == ["foo-model", "bar-model"]
+
+
+def test_answerer_falls_back_when_no_factory():
+    """Without a factory, all runs use the default answerer."""
+    answerer = TogetherBackend(model="default-model", api_key="sk-dummy")
+    pred = OperadicConsistencyPredictor(answerer=answerer)
+    backend_a, id_a = pred._answerer_for_run("qa:model=run-a-model,k=v")
+    backend_b, id_b = pred._answerer_for_run("qa:model=run-b-model,k=v")
+    assert backend_a is answerer
+    assert backend_b is answerer
+    assert id_a == id_b == "default-model"
+
+
+def test_constructor_rejects_empty_config():
+    """No answerer, no factory, no legacy kwargs → ValueError."""
+    with pytest.raises(ValueError):
+        OperadicConsistencyPredictor()
+
+
+def test_constructor_accepts_factory_with_explicit_decomposer():
+    """Factory-only is allowed as long as a decomposer is given explicitly."""
+    decomposer = TogetherBackend(model="dm", api_key="sk-dummy")
+    pred = OperadicConsistencyPredictor(
+        answerer_factory=lambda m: TogetherBackend(model=m, api_key="sk-dummy"),
+        decomposer=decomposer,
+    )
+    assert pred.answerer is None
+    assert pred.answerer_factory is not None
+    assert pred.decomposer is decomposer
+
+
+def test_plan_next_batch_emits_per_run_answerer_models():
+    """Batched path puts the per-run model ID into InferenceRequest.model."""
+    pytest.importorskip("pandas")
+    pd = pytest.importorskip("pandas")
+
+    # Build a split where each run's name encodes a different model.
+    def _rows(run_name: str, n_q: int) -> list[dict]:
+        return [
+            {
+                "run_spec.name": run_name,
+                "scenario_state.request_states.instance.input.text": f"{run_name}-q{i}",
+                "scenario_state.request_states.result.completions":
+                    [{"text": f"direct-{i}"}],
+            }
+            for i in range(n_q)
+        ]
+
+    train_rows = _rows("qa:model=llama-8b,k=v", 2) + _rows("qa:model=qwen-7b,k=v", 2)
+    test_rows = _rows("qa:model=mystery-70b,k=v", 2)
+
+    class _Split:
+        def __init__(self, scenario_state, stats=None):
+            self.scenario_state = scenario_state
+            self.stats = stats
+
+    train = _Split(
+        pd.DataFrame(train_rows),
+        pd.DataFrame([
+            {"run_spec.name": "qa:model=llama-8b,k=v",
+             "stats.name.name": "exact_match", "stats.name.split": "valid",
+             "stats.mean": 0.3},
+            {"run_spec.name": "qa:model=qwen-7b,k=v",
+             "stats.name.name": "exact_match", "stats.name.split": "valid",
+             "stats.mean": 0.5},
+        ]),
+    )
+    test = _Split(pd.DataFrame(test_rows))
+
+    pred = OperadicConsistencyPredictor(
+        answerer_factory=lambda m: TogetherBackend(model=m, api_key="sk-dummy"),
+        decomposer=TogetherBackend(model="fixed-decomposer", api_key="sk-dummy"),
+        num_example_runs=2,
+        num_eval_samples=2,
+        n_consistency_samples=2,
+    )
+
+    cache: dict = {}
+
+    # Phase 1: decomposition only — model should always be the fixed decomposer
+    phase1 = pred.plan_next_batch(train, test, cache)
+    assert all(r.role == "decomposer" for r in phase1)
+    assert {r.model for r in phase1} == {"fixed-decomposer"}
+    for r in phase1:
+        q = r.prompt.split("Question: ", 1)[1].strip()
+        cache[r.request_id] = f"Q1: s-{q}\nQ2: f given [A1]?"
+
+    # Phase 2: Q1 answerer — per-run models should appear
+    phase2 = pred.plan_next_batch(train, test, cache)
+    assert all(r.role == "answerer" for r in phase2)
+    phase2_models = {r.model for r in phase2}
+    assert phase2_models == {"llama-8b", "qwen-7b", "mystery-70b"}

@@ -61,10 +61,12 @@ for backward compatibility and will auto-construct a ``TogetherBackend``.
 """
 from __future__ import annotations
 
-import re
+import hashlib
 import json
 import logging
-from typing import Optional, Sequence
+import re
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -113,32 +115,41 @@ ANSWER_PROMPT = (
 )
 
 
+def _parse_decomposition(raw: str) -> Optional[tuple[str, str]]:
+    """Parse a decomposer's ``'Q1: ...\\nQ2: ...'`` output into ``(q1, q2_template)``.
+
+    Returns ``None`` if the format can't be parsed. If Q2 does not contain the
+    ``[A1]`` placeholder, one is appended so downstream rendering still works.
+    This function is pure — it's reused by both the dynamic and batched paths.
+    """
+    q1_m = re.search(r"Q1:\s*(.+?)(?:\n|$)", raw)
+    q2_m = re.search(r"Q2:\s*(.+?)(?:\n|$)", raw)
+    if not q1_m or not q2_m:
+        return None
+    q1 = q1_m.group(1).strip()
+    q2 = q2_m.group(1).strip()
+    if "[A1]" not in q2:
+        q2 = q2 + " (given that [A1])"
+    return q1, q2
+
+
+def _clean_answer(raw: str) -> str:
+    """Normalize an answerer's raw completion down to a single short phrase."""
+    return raw.strip().split("\n")[0].strip()
+
+
 def _decompose(question: str, backend: LLMBackend) -> Optional[tuple[str, str]]:
     """Decompose a question into (q1, q2_template) via ``backend``; None on failure."""
     prompt = DECOMPOSE_PROMPT.format(question=question)
     raw = backend.complete(prompt, max_tokens=128)
-
-    q1_m = re.search(r"Q1:\s*(.+?)(?:\n|$)", raw)
-    q2_m = re.search(r"Q2:\s*(.+?)(?:\n|$)", raw)
-
-    if not q1_m or not q2_m:
-        return None
-
-    q1 = q1_m.group(1).strip()
-    q2 = q2_m.group(1).strip()
-
-    # Validate that Q2 references [A1]
-    if "[A1]" not in q2:
-        q2 = q2 + " (given that [A1])"
-
-    return q1, q2
+    return _parse_decomposition(raw)
 
 
 def _answer(question: str, backend: LLMBackend) -> str:
     """Get a short answer to a question via ``backend``."""
     prompt = ANSWER_PROMPT.format(question=question)
     raw = backend.complete(prompt, max_tokens=32)
-    return raw.strip().split("\n")[0].strip()
+    return _clean_answer(raw)
 
 
 # ── Consistency computation ───────────────────────────────────────────────────
@@ -189,6 +200,117 @@ def compute_consistency_for_run(
 
         except Exception as e:
             log.warning("Consistency check error: %s", e)
+
+    if n_total == 0:
+        return 0.0
+    return n_consistent / n_total
+
+
+# ── Batched inference API (for TA2 harness integration) ──────────────────────
+
+# The batched path lets the TA2 harness precompute all LLM calls the predictor
+# needs in a small number of sequential batches (decompose → answer-Q1 →
+# answer-Q2). The predictor then computes consistency from the filled cache
+# with no further inference. This matches Kitware's preferred integration:
+# LLM calls are owned by the harness, not by the predictor.
+#
+# Flow:
+#     cache: dict[str, str] = {}
+#     while True:
+#         batch = predictor.plan_next_batch(train, test, cache)
+#         if not batch:
+#             break
+#         results = harness.run_batch(batch)          # {request_id: text}
+#         cache.update(results)
+#     predictions = predictor.predict_from_cache(train, test, cache)
+
+
+@dataclass(frozen=True)
+class InferenceRequest:
+    """A single LLM call declared by the predictor.
+
+    The harness is expected to execute a batch of these requests and return
+    results keyed by ``request_id`` so the predictor can look them up.
+    ``request_id`` is a deterministic hash of ``(role, model, prompt)``, which
+    means two requests with the same triple are naturally deduplicated.
+    """
+    request_id: str
+    role: str            # "decomposer" or "answerer"
+    model: str           # model ID (harness uses this for routing)
+    prompt: str
+    max_tokens: int = 128
+    temperature: float = 0.0
+
+
+def _request_id(role: str, model: str, prompt: str) -> str:
+    """Deterministic request ID: ``<role>:<16-char sha256(role|model|prompt)>``."""
+    key = f"{role}|{model}|{prompt}".encode("utf-8")
+    return f"{role}:" + hashlib.sha256(key).hexdigest()[:16]
+
+
+def _make_decompose_request(question: str, model: str) -> InferenceRequest:
+    prompt = DECOMPOSE_PROMPT.format(question=question)
+    return InferenceRequest(
+        request_id=_request_id("decomposer", model, prompt),
+        role="decomposer",
+        model=model,
+        prompt=prompt,
+        max_tokens=128,
+    )
+
+
+def _make_answer_request(question: str, model: str) -> InferenceRequest:
+    prompt = ANSWER_PROMPT.format(question=question)
+    return InferenceRequest(
+        request_id=_request_id("answerer", model, prompt),
+        role="answerer",
+        model=model,
+        prompt=prompt,
+        max_tokens=32,
+    )
+
+
+def _consistency_from_cache(
+    questions: Sequence[str],
+    direct_answers: Sequence[str],
+    answerer_model: str,
+    decomposer_model: str,
+    cache: Mapping[str, str],
+    f1_threshold: float = 0.5,
+) -> float:
+    """Pure-computation version of ``compute_consistency_for_run``.
+
+    Reads decomposition/Q1/Q2 completions from ``cache`` instead of calling an
+    LLM. A missing cache entry is treated as a failed step, which makes the
+    instance count as inconsistent — same policy as the dynamic path.
+    """
+    n_consistent = 0
+    n_total = 0
+
+    for question, direct in zip(questions, direct_answers):
+        n_total += 1
+
+        decomp_req = _make_decompose_request(question, decomposer_model)
+        raw_decomp = cache.get(decomp_req.request_id, "")
+        decomp = _parse_decomposition(raw_decomp)
+        if decomp is None:
+            continue
+
+        q1, q2_tmpl = decomp
+
+        q1_req = _make_answer_request(q1, answerer_model)
+        a1 = _clean_answer(cache.get(q1_req.request_id, ""))
+        if not a1:
+            continue
+
+        q2 = q2_tmpl.replace("[A1]", a1)
+        q2_req = _make_answer_request(q2, answerer_model)
+        expansion = _clean_answer(cache.get(q2_req.request_id, ""))
+        if not expansion:
+            continue
+
+        if _token_f1(direct, expansion) >= f1_threshold:
+            n_consistent += 1
 
     if n_total == 0:
         return 0.0
@@ -323,12 +445,17 @@ try:
     _MAGNET_AVAILABLE = True
 except ImportError:
     _MAGNET_AVAILABLE = False
-    # Define stubs so the module can still be imported without magnet installed
+    # Define stubs so the module can still be imported (and tested) without
+    # magnet installed. Both base classes accept arbitrary kwargs so the
+    # predictor's constructor/predict paths still function in a fake harness.
     class RunPredictor:  # type: ignore[no-redef]
         def __init__(self, **kwargs):
-            pass
+            for k, v in kwargs.items():
+                setattr(self, k, v)
     class RunPrediction:  # type: ignore[no-redef]
-        pass
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
     class TrainSplit:  # type: ignore[no-redef]
         pass
     class SequesteredTestSplit:  # type: ignore[no-redef]
@@ -420,23 +547,35 @@ class OperadicConsistencyPredictor(RunPredictor):
         self.stat_split = stat_split
         self.f1_threshold = f1_threshold
         self.n_consistency_samples = n_consistency_samples
+        # Also set random_seed on self so helpers work even when MAGNET isn't
+        # installed (in which case the parent is a stub that ignores kwargs).
+        self.random_seed = random_seed
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _consistency_for_df(self, scenario_df) -> float:
-        """Compute consistency rate for a scenario_state DataFrame."""
+    def _sampled_questions(self, scenario_df) -> tuple[list[str], list[str]]:
+        """Deterministically sample ``n_consistency_samples`` questions from a run.
+
+        Uses ``np.random.default_rng(self.random_seed)`` so the same indices are
+        picked every time the method is called with the same DataFrame. This is
+        essential for the batched path — planning and prediction must agree on
+        which questions they're looking at so the request IDs line up.
+        """
         questions, directs = _extract_questions_and_answers(scenario_df)
-
         if not questions:
-            log.warning("No questions extracted from scenario_state.")
-            return 0.0
+            return [], []
 
-        # Subsample
         n = min(self.n_consistency_samples, len(questions))
         rng = np.random.default_rng(self.random_seed)
         idx = rng.choice(len(questions), size=n, replace=False)
-        questions = [questions[i] for i in idx]
-        directs = [directs[i] for i in idx]
+        return [questions[i] for i in idx], [directs[i] for i in idx]
+
+    def _consistency_for_df(self, scenario_df) -> float:
+        """Compute consistency rate for a scenario_state DataFrame (dynamic path)."""
+        questions, directs = self._sampled_questions(scenario_df)
+        if not questions:
+            log.warning("No questions extracted from scenario_state.")
+            return 0.0
 
         return compute_consistency_for_run(
             questions=questions,
@@ -445,6 +584,164 @@ class OperadicConsistencyPredictor(RunPredictor):
             decomposer=self.decomposer,
             f1_threshold=self.f1_threshold,
         )
+
+    # ── Batched inference path ────────────────────────────────────────────────
+
+    def _iter_all_runs(self, train_split, sequestered_test_split):
+        """Yield (run_name, sampled_questions, sampled_directs) for every run
+        in both splits, using the same deterministic sampling as the dynamic path."""
+        for run_name, grp in train_split.scenario_state.groupby("run_spec.name"):
+            qs, ds = self._sampled_questions(grp)
+            yield run_name, qs, ds
+        for run_name, grp in sequestered_test_split.scenario_state.groupby("run_spec.name"):
+            qs, ds = self._sampled_questions(grp)
+            yield run_name, qs, ds
+
+    def plan_next_batch(
+        self,
+        train_split,
+        sequestered_test_split,
+        cache: Mapping[str, str],
+    ) -> list[InferenceRequest]:
+        """Return the next batch of unfulfilled LLM requests, or ``[]`` when done.
+
+        The batched flow has up to three sequential phases:
+
+        1. **Decompose** each sampled question (decomposer model).
+        2. **Answer Q1** for each successful decomposition (answerer model).
+        3. **Answer Q2** with ``[A1]`` filled from the cached Q1 result.
+
+        The caller is expected to execute each returned batch, merge the
+        results into ``cache`` (``{request_id: completion_text}``), and call
+        this method again until it returns ``[]``.
+
+        Requests are deduplicated by ``request_id`` so asking the same
+        (role, model, prompt) triple twice — e.g. the same question appearing
+        in multiple runs — only costs one inference call.
+        """
+        decomposer_model = getattr(self.decomposer, "model", "unknown-decomposer")
+        answerer_model = getattr(self.answerer, "model", "unknown-answerer")
+
+        runs = list(self._iter_all_runs(train_split, sequestered_test_split))
+
+        # ── Phase 1: decomposition ────────────────────────────────────────────
+        decompose_reqs: dict[str, InferenceRequest] = {}
+        for _, questions, _ in runs:
+            for q in questions:
+                req = _make_decompose_request(q, decomposer_model)
+                if req.request_id not in cache:
+                    decompose_reqs[req.request_id] = req
+        if decompose_reqs:
+            return list(decompose_reqs.values())
+
+        # ── Phase 2: answer Q1 ────────────────────────────────────────────────
+        q1_reqs: dict[str, InferenceRequest] = {}
+        for _, questions, _ in runs:
+            for q in questions:
+                decomp_req = _make_decompose_request(q, decomposer_model)
+                decomp = _parse_decomposition(cache.get(decomp_req.request_id, ""))
+                if decomp is None:
+                    continue
+                q1, _ = decomp
+                req = _make_answer_request(q1, answerer_model)
+                if req.request_id not in cache:
+                    q1_reqs[req.request_id] = req
+        if q1_reqs:
+            return list(q1_reqs.values())
+
+        # ── Phase 3: answer Q2 (with [A1] substituted) ────────────────────────
+        q2_reqs: dict[str, InferenceRequest] = {}
+        for _, questions, _ in runs:
+            for q in questions:
+                decomp_req = _make_decompose_request(q, decomposer_model)
+                decomp = _parse_decomposition(cache.get(decomp_req.request_id, ""))
+                if decomp is None:
+                    continue
+                q1, q2_tmpl = decomp
+                a1_req = _make_answer_request(q1, answerer_model)
+                a1 = _clean_answer(cache.get(a1_req.request_id, ""))
+                if not a1:
+                    continue
+                q2 = q2_tmpl.replace("[A1]", a1)
+                req = _make_answer_request(q2, answerer_model)
+                if req.request_id not in cache:
+                    q2_reqs[req.request_id] = req
+        if q2_reqs:
+            return list(q2_reqs.values())
+
+        return []
+
+    def predict_from_cache(
+        self,
+        train_split,
+        sequestered_test_split,
+        cache: Mapping[str, str],
+    ) -> list:
+        """Batched counterpart to ``predict``: compute predictions from the
+        filled-in ``cache``, making no LLM calls.
+
+        Assumes ``plan_next_batch`` has been run to completion and all its
+        returned requests have been executed by the harness.
+        """
+        decomposer_model = getattr(self.decomposer, "model", "unknown-decomposer")
+        answerer_model = getattr(self.answerer, "model", "unknown-answerer")
+
+        # ── Step 1: calibrate from training runs ─────────────────────────────
+        consistencies: list[float] = []
+        accuracies: list[float] = []
+
+        for run_spec_name, grp in train_split.scenario_state.groupby("run_spec.name"):
+            log.info("Reading cached consistency for training run: %s", run_spec_name)
+            questions, directs = self._sampled_questions(grp)
+            consistency = _consistency_from_cache(
+                questions=questions,
+                direct_answers=directs,
+                answerer_model=answerer_model,
+                decomposer_model=decomposer_model,
+                cache=cache,
+                f1_threshold=self.f1_threshold,
+            )
+            accuracy = self._accuracy_from_stats(train_split.stats, run_spec_name)
+            if accuracy is not None:
+                consistencies.append(consistency)
+                accuracies.append(accuracy)
+                log.info("  consistency=%.3f  accuracy=%.3f", consistency, accuracy)
+
+        calibration = _LinearCalibration.fit(consistencies, accuracies)
+        log.info(
+            "Calibration: accuracy ≈ %.3f * consistency + %.3f  (n=%d)",
+            calibration.slope, calibration.intercept, calibration.n_points,
+        )
+
+        # ── Step 2: predict for sequestered test runs ────────────────────────
+        predictions = []
+        for run_spec_name, grp in sequestered_test_split.scenario_state.groupby(
+            "run_spec.name"
+        ):
+            questions, directs = self._sampled_questions(grp)
+            consistency = _consistency_from_cache(
+                questions=questions,
+                direct_answers=directs,
+                answerer_model=answerer_model,
+                decomposer_model=decomposer_model,
+                cache=cache,
+                f1_threshold=self.f1_threshold,
+            )
+            predicted_accuracy = calibration.predict(consistency)
+            log.info(
+                "  %s: consistency=%.3f  predicted_accuracy=%.3f",
+                run_spec_name, consistency, predicted_accuracy,
+            )
+            predictions.append(
+                RunPrediction(
+                    run_spec_name=run_spec_name,
+                    split=self.stat_split,
+                    stat_name=self.stat_name,
+                    mean=predicted_accuracy,
+                )
+            )
+
+        return predictions
 
     def _accuracy_from_stats(self, stats_df, run_spec_name: str) -> Optional[float]:
         """Extract the target accuracy metric from a stats DataFrame."""

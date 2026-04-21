@@ -13,10 +13,15 @@ import pytest
 
 from operadic_consistency.magnet.backends import LLMBackend, TogetherBackend
 from operadic_consistency.magnet.predictor import (
+    InferenceRequest,
+    OperadicConsistencyPredictor,
+    _consistency_from_cache,
+    _extract_completion_text,
+    _LinearCalibration,
+    _make_answer_request,
+    _make_decompose_request,
     _normalize,
     _token_f1,
-    _LinearCalibration,
-    _extract_completion_text,
     compute_consistency_for_run,
 )
 
@@ -179,3 +184,195 @@ def test_compute_consistency_mixed():
         decomposer=decomposer,
     )
     assert consistency == pytest.approx(0.5)
+
+
+# ── Batched inference API ─────────────────────────────────────────────────────
+
+def test_request_id_is_deterministic():
+    """Same (role, model, prompt) triple → same request_id; different triple → different."""
+    r1 = _make_decompose_request("Where was Nolan born?", "m1")
+    r2 = _make_decompose_request("Where was Nolan born?", "m1")
+    r3 = _make_decompose_request("Where was Nolan born?", "m2")  # different model
+    r4 = _make_decompose_request("Where was Spielberg born?", "m1")  # different question
+    assert r1.request_id == r2.request_id
+    assert r1.request_id != r3.request_id
+    assert r1.request_id != r4.request_id
+
+
+def test_request_id_roles_distinct():
+    """A decomposer request and an answerer request never collide."""
+    d = _make_decompose_request("q", "m")
+    a = _make_answer_request("q", "m")
+    assert d.request_id != a.request_id
+    assert d.role == "decomposer"
+    assert a.role == "answerer"
+
+
+def test_consistency_from_cache_matches_dynamic_path():
+    """Filling the cache with what the dynamic path would get produces the same score."""
+    decomposer_model = "dm"
+    answerer_model = "am"
+
+    question = "Where was the director of Inception born?"
+    direct = "London"
+
+    # Build the cache as if a harness had run the three phases
+    cache = {}
+    decomp_req = _make_decompose_request(question, decomposer_model)
+    cache[decomp_req.request_id] = "Q1: Who directed Inception?\nQ2: Where was [A1] born?"
+
+    q1_req = _make_answer_request("Who directed Inception?", answerer_model)
+    cache[q1_req.request_id] = "Christopher Nolan"
+
+    q2_req = _make_answer_request("Where was Christopher Nolan born?", answerer_model)
+    cache[q2_req.request_id] = "London"
+
+    consistency = _consistency_from_cache(
+        questions=[question],
+        direct_answers=[direct],
+        answerer_model=answerer_model,
+        decomposer_model=decomposer_model,
+        cache=cache,
+    )
+    assert consistency == pytest.approx(1.0)
+
+
+def test_consistency_from_cache_missing_entry_counts_inconsistent():
+    """Missing cache entries are treated as failed steps → inconsistent."""
+    consistency = _consistency_from_cache(
+        questions=["Q?"],
+        direct_answers=["A"],
+        answerer_model="am",
+        decomposer_model="dm",
+        cache={},   # nothing precomputed
+    )
+    assert consistency == pytest.approx(0.0)
+
+
+# ── plan_next_batch + predict_from_cache end-to-end ──────────────────────────
+
+def _make_fake_splits(n_train_runs: int, n_test_runs: int, n_questions: int):
+    """Build minimal TrainSplit/SequesteredTestSplit-shaped objects backed by
+    pandas DataFrames. Good enough for the predictor's .groupby access pattern."""
+    pd = pytest.importorskip("pandas")
+
+    def _scenario_rows(run_name: str) -> list[dict]:
+        return [
+            {
+                "run_spec.name": run_name,
+                "scenario_state.request_states.instance.input.text": f"{run_name}-q{i}",
+                "scenario_state.request_states.result.completions":
+                    [{"text": f"{run_name}-direct-{i}"}],
+            }
+            for i in range(n_questions)
+        ]
+
+    train_rows, stats_rows = [], []
+    for i in range(n_train_runs):
+        name = f"train-run-{i}"
+        train_rows += _scenario_rows(name)
+        stats_rows.append({
+            "run_spec.name": name,
+            "stats.name.name": "exact_match",
+            "stats.name.split": "valid",
+            "stats.mean": 0.3 + 0.1 * i,   # distinct values so calibration has signal
+        })
+
+    test_rows = []
+    for i in range(n_test_runs):
+        test_rows += _scenario_rows(f"test-run-{i}")
+
+    class _Split:
+        def __init__(self, scenario_state, stats=None):
+            self.scenario_state = scenario_state
+            self.stats = stats
+
+    train_split = _Split(pd.DataFrame(train_rows), pd.DataFrame(stats_rows))
+    test_split = _Split(pd.DataFrame(test_rows))
+    return train_split, test_split
+
+
+def test_plan_next_batch_three_phases_then_empty():
+    """plan_next_batch walks decompose → Q1 → Q2 → []."""
+    pytest.importorskip("pandas")
+    train, test = _make_fake_splits(n_train_runs=2, n_test_runs=1, n_questions=2)
+
+    # Dummy backends — we only care about their .model attribute here.
+    answerer = TogetherBackend(model="am", api_key="sk-dummy")
+    decomposer = TogetherBackend(model="dm", api_key="sk-dummy")
+    pred = OperadicConsistencyPredictor(
+        answerer=answerer,
+        decomposer=decomposer,
+        num_example_runs=2,
+        num_eval_samples=2,
+        n_consistency_samples=2,
+    )
+
+    cache: dict = {}
+    # Phase 1: decomposition requests only
+    phase1 = pred.plan_next_batch(train, test, cache)
+    assert phase1, "expected a non-empty decomposition batch"
+    assert all(r.role == "decomposer" for r in phase1)
+    assert all(r.model == "dm" for r in phase1)
+    # Fulfill with well-formed decompositions
+    for req in phase1:
+        q_text = req.prompt.split("Question: ", 1)[1].strip()
+        cache[req.request_id] = f"Q1: sub of {q_text}\nQ2: follow-up given [A1]?"
+
+    # Phase 2: Q1 answerer requests
+    phase2 = pred.plan_next_batch(train, test, cache)
+    assert phase2, "expected a non-empty Q1 batch"
+    assert all(r.role == "answerer" for r in phase2)
+    assert all(r.model == "am" for r in phase2)
+    for req in phase2:
+        cache[req.request_id] = "A1-answer"
+
+    # Phase 3: Q2 answerer requests (rendered with A1)
+    phase3 = pred.plan_next_batch(train, test, cache)
+    assert phase3, "expected a non-empty Q2 batch"
+    assert all(r.role == "answerer" for r in phase3)
+    # Each Q2 prompt should contain the resolved A1 text
+    assert all("A1-answer" in r.prompt for r in phase3)
+    for req in phase3:
+        cache[req.request_id] = "expansion"
+
+    # Phase 4: done
+    assert pred.plan_next_batch(train, test, cache) == []
+
+
+def test_predict_from_cache_produces_predictions():
+    """After filling the cache via plan_next_batch, predict_from_cache returns one
+    RunPrediction per sequestered test run."""
+    pytest.importorskip("pandas")
+    train, test = _make_fake_splits(n_train_runs=2, n_test_runs=2, n_questions=2)
+
+    answerer = TogetherBackend(model="am", api_key="sk-dummy")
+    decomposer = TogetherBackend(model="dm", api_key="sk-dummy")
+    pred = OperadicConsistencyPredictor(
+        answerer=answerer,
+        decomposer=decomposer,
+        num_example_runs=2,
+        num_eval_samples=2,
+        n_consistency_samples=2,
+    )
+
+    # Walk phases, filling the cache
+    cache: dict = {}
+    while True:
+        batch = pred.plan_next_batch(train, test, cache)
+        if not batch:
+            break
+        for req in batch:
+            if req.role == "decomposer":
+                q = req.prompt.split("Question: ", 1)[1].strip()
+                cache[req.request_id] = f"Q1: s-{q}\nQ2: follow-up given [A1]?"
+            else:
+                cache[req.request_id] = "placeholder-answer"
+
+    predictions = pred.predict_from_cache(train, test, cache)
+    # One prediction per test run, and each prediction's mean is in [0, 1]
+    test_run_names = {f"test-run-{i}" for i in range(2)}
+    assert {p.run_spec_name for p in predictions} == test_run_names
+    for p in predictions:
+        assert 0.0 <= p.mean <= 1.0
+        assert p.stat_name == "exact_match"

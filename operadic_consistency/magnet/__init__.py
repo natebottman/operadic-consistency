@@ -7,6 +7,14 @@ goes through a swappable ``LLMBackend`` so the TA2 harness can supply its own
 completion endpoint.
 """
 from operadic_consistency.magnet.backends import LLMBackend, TogetherBackend
-from operadic_consistency.magnet.predictor import OperadicConsistencyPredictor
+from operadic_consistency.magnet.predictor import (
+    InferenceRequest,
+    OperadicConsistencyPredictor,
+)
 
-__all__ = ["OperadicConsistencyPredictor", "LLMBackend", "TogetherBackend"]
+__all__ = [
+    "OperadicConsistencyPredictor",
+    "LLMBackend",
+    "TogetherBackend",
+    "InferenceRequest",
+]

@@ -34,18 +34,30 @@ The MAGNET interface cleanly separates the two groups the caller provides:
 
 Usage
 -----
+The predictor is driven by swappable ``LLMBackend`` objects. The reference
+backend calls Together.ai; the TA2 harness can plug in a vllm server or any
+other completion endpoint without touching this module (see
+``operadic_consistency.magnet.backends``).
+
 ::
 
-    from operadic_consistency.magnet import OperadicConsistencyPredictor
+    from operadic_consistency.magnet import (
+        OperadicConsistencyPredictor, TogetherBackend,
+    )
 
+    answerer = TogetherBackend(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        api_key="YOUR_KEY",
+    )
     predictor = OperadicConsistencyPredictor(
-        answerer_model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-        together_api_key="YOUR_KEY",
-        decomposer_model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        answerer=answerer,              # decomposer defaults to answerer
         num_eval_samples=20,
         n_consistency_samples=20,
     )
     predictor(helm_suites="path/to/benchmark_output/runs/suite_name")
+
+Legacy kwargs (``answerer_model`` + ``together_api_key``) are still accepted
+for backward compatibility and will auto-construct a ``TogetherBackend``.
 """
 from __future__ import annotations
 
@@ -55,6 +67,8 @@ import logging
 from typing import Optional, Sequence
 
 import numpy as np
+
+from operadic_consistency.magnet.backends import LLMBackend, TogetherBackend
 
 log = logging.getLogger(__name__)
 
@@ -83,30 +97,6 @@ def _token_f1(pred: str, gold: str) -> float:
 
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
-def _together_complete(
-    prompt: str,
-    model: str,
-    api_key: str,
-    max_tokens: int = 128,
-    temperature: float = 0.0,
-) -> str:
-    """Call Together.ai completion API and return the generated text."""
-    try:
-        import together
-        client = together.Together(api_key=api_key)
-        resp = client.completions.create(
-            model=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=["\n\n", "###"],
-        )
-        return resp.choices[0].text.strip()
-    except Exception as e:
-        log.warning("Together.ai call failed: %s", e)
-        return ""
-
-
 DECOMPOSE_PROMPT = (
     "Break the following multi-hop question into exactly two sub-questions "
     "where the answer to the first fills a blank in the second.\n"
@@ -123,10 +113,10 @@ ANSWER_PROMPT = (
 )
 
 
-def _decompose(question: str, model: str, api_key: str) -> Optional[tuple[str, str]]:
-    """Decompose a question into (q1, q2_template) or None on failure."""
+def _decompose(question: str, backend: LLMBackend) -> Optional[tuple[str, str]]:
+    """Decompose a question into (q1, q2_template) via ``backend``; None on failure."""
     prompt = DECOMPOSE_PROMPT.format(question=question)
-    raw = _together_complete(prompt, model, api_key, max_tokens=128)
+    raw = backend.complete(prompt, max_tokens=128)
 
     q1_m = re.search(r"Q1:\s*(.+?)(?:\n|$)", raw)
     q2_m = re.search(r"Q2:\s*(.+?)(?:\n|$)", raw)
@@ -144,10 +134,10 @@ def _decompose(question: str, model: str, api_key: str) -> Optional[tuple[str, s
     return q1, q2
 
 
-def _answer(question: str, model: str, api_key: str) -> str:
-    """Get a short answer to a question."""
+def _answer(question: str, backend: LLMBackend) -> str:
+    """Get a short answer to a question via ``backend``."""
     prompt = ANSWER_PROMPT.format(question=question)
-    raw = _together_complete(prompt, model, api_key, max_tokens=32)
+    raw = backend.complete(prompt, max_tokens=32)
     return raw.strip().split("\n")[0].strip()
 
 
@@ -156,16 +146,15 @@ def _answer(question: str, model: str, api_key: str) -> str:
 def compute_consistency_for_run(
     questions: Sequence[str],
     direct_answers: Sequence[str],
-    answerer_model: str,
-    api_key: str,
-    decomposer_model: str,
+    answerer: LLMBackend,
+    decomposer: LLMBackend,
     f1_threshold: float = 0.5,
 ) -> float:
     """
     For each (question, direct_answer) pair:
-      1. Decompose question → (q1, q2_template)
-      2. Answer q1 → a1
-      3. Render q2 with a1 → answer q2 → expansion_answer
+      1. Decompose question via ``decomposer`` → (q1, q2_template)
+      2. Answer q1 via ``answerer`` → a1
+      3. Render q2 with a1 → answer q2 via ``answerer`` → expansion_answer
       4. consistent_i = token_f1(direct_answer, expansion_answer) >= threshold
 
     Returns fraction of consistent instances (0.0–1.0).
@@ -177,7 +166,7 @@ def compute_consistency_for_run(
     for question, direct in zip(questions, direct_answers):
         n_total += 1
         try:
-            decomp = _decompose(question, decomposer_model, api_key)
+            decomp = _decompose(question, decomposer)
             if decomp is None:
                 log.debug("Decompose failed for: %s", question[:60])
                 continue
@@ -185,13 +174,13 @@ def compute_consistency_for_run(
             q1, q2_tmpl = decomp
 
             # Answer q1
-            a1 = _answer(q1, answerer_model, api_key)
+            a1 = _answer(q1, answerer)
             if not a1:
                 continue
 
             # Render q2 with a1
             q2 = q2_tmpl.replace("[A1]", a1)
-            expansion = _answer(q2, answerer_model, api_key)
+            expansion = _answer(q2, answerer)
             if not expansion:
                 continue
 
@@ -350,16 +339,23 @@ class OperadicConsistencyPredictor(RunPredictor):
     """
     Predict HELM run accuracy using operadic consistency as a signal.
 
+    The predictor performs all LLM calls through swappable ``LLMBackend``
+    objects, so the TA2 harness can substitute its own inference setup
+    (e.g. a vllm server) without touching this class.
+
     Parameters
     ----------
-    answerer_model:
-        Together.ai model ID used to answer sub-questions during the
-        consistency expansion.
-    together_api_key:
-        Together.ai API key.
-    decomposer_model:
-        Together.ai model ID used to decompose questions into sub-questions.
-        Defaults to the same model as ``answerer_model``.
+    answerer:
+        ``LLMBackend`` used to answer sub-questions during consistency
+        expansion. If omitted, ``answerer_model`` + ``together_api_key``
+        must be provided; a ``TogetherBackend`` will be constructed for
+        backward compatibility.
+    decomposer:
+        ``LLMBackend`` used to decompose questions into sub-questions.
+        Defaults to ``answerer`` if omitted.
+    answerer_model, together_api_key, decomposer_model:
+        Legacy kwargs. Provide these to auto-construct ``TogetherBackend``
+        instances. Ignored if ``answerer`` is passed explicitly.
     stat_name:
         The HELM metric to predict (default: ``"exact_match"``).
     stat_split:
@@ -380,8 +376,11 @@ class OperadicConsistencyPredictor(RunPredictor):
 
     def __init__(
         self,
-        answerer_model: str,
-        together_api_key: str,
+        answerer: Optional[LLMBackend] = None,
+        decomposer: Optional[LLMBackend] = None,
+        *,
+        answerer_model: Optional[str] = None,
+        together_api_key: Optional[str] = None,
         decomposer_model: Optional[str] = None,
         stat_name: str = "exact_match",
         stat_split: str = "valid",
@@ -396,9 +395,27 @@ class OperadicConsistencyPredictor(RunPredictor):
             num_eval_samples=num_eval_samples,
             random_seed=random_seed,
         )
-        self.answerer_model = answerer_model
-        self.together_api_key = together_api_key
-        self.decomposer_model = decomposer_model or answerer_model
+
+        # Resolve backends. Prefer explicit backend objects; fall back to the
+        # legacy (model, api_key) kwargs by auto-wrapping in TogetherBackend.
+        if answerer is None:
+            if answerer_model is None or together_api_key is None:
+                raise ValueError(
+                    "Must provide either `answerer` (LLMBackend) or both "
+                    "`answerer_model` and `together_api_key`."
+                )
+            answerer = TogetherBackend(model=answerer_model, api_key=together_api_key)
+
+        if decomposer is None:
+            if decomposer_model is not None and together_api_key is not None:
+                decomposer = TogetherBackend(
+                    model=decomposer_model, api_key=together_api_key
+                )
+            else:
+                decomposer = answerer  # default: reuse answerer
+
+        self.answerer: LLMBackend = answerer
+        self.decomposer: LLMBackend = decomposer
         self.stat_name = stat_name
         self.stat_split = stat_split
         self.f1_threshold = f1_threshold
@@ -424,9 +441,8 @@ class OperadicConsistencyPredictor(RunPredictor):
         return compute_consistency_for_run(
             questions=questions,
             direct_answers=directs,
-            answerer_model=self.answerer_model,
-            api_key=self.together_api_key,
-            decomposer_model=self.decomposer_model,
+            answerer=self.answerer,
+            decomposer=self.decomposer,
             f1_threshold=self.f1_threshold,
         )
 

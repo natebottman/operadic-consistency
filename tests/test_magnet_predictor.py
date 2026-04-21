@@ -5,14 +5,19 @@ These tests cover the parts that don't require MAGNET or Together.ai installed:
 - Token F1 normalization
 - Linear calibration
 - Scenario-state column extraction helpers
+- LLMBackend protocol + consistency computation against a mock backend
 """
+from typing import Optional, Sequence
+
 import pytest
 
+from operadic_consistency.magnet.backends import LLMBackend, TogetherBackend
 from operadic_consistency.magnet.predictor import (
     _normalize,
     _token_f1,
     _LinearCalibration,
     _extract_completion_text,
+    compute_consistency_for_run,
 )
 
 
@@ -82,3 +87,95 @@ def test_extract_completion_text_list_of_dicts():
 
 def test_extract_completion_text_empty_list():
     assert _extract_completion_text([]) == ""
+
+
+# ── LLMBackend protocol & mock backend ────────────────────────────────────────
+
+class _MockBackend:
+    """Test backend that returns pre-canned responses by prompt-keyword match.
+
+    ``responses`` maps keyword → response text. The first keyword that
+    appears in the incoming prompt wins. Unmatched prompts return "".
+    """
+
+    def __init__(self, responses: dict):
+        self.responses = responses
+        self.calls: list[str] = []
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 128,
+        temperature: float = 0.0,
+        stop: Optional[Sequence[str]] = None,
+    ) -> str:
+        self.calls.append(prompt)
+        for keyword, resp in self.responses.items():
+            if keyword in prompt:
+                return resp
+        return ""
+
+
+def test_mock_backend_satisfies_protocol():
+    """Protocol is structural — a mock with `complete` should be recognized."""
+    backend = _MockBackend({})
+    assert isinstance(backend, LLMBackend)
+
+
+def test_together_backend_satisfies_protocol():
+    backend = TogetherBackend(model="dummy/model", api_key="sk-dummy")
+    assert isinstance(backend, LLMBackend)
+
+
+def test_compute_consistency_all_consistent():
+    """When decomposition and sub-answers reconstruct the direct answer, consistency=1."""
+    decomposer = _MockBackend({
+        "Where was the director of Inception born?":
+            "Q1: Who directed Inception?\nQ2: Where was [A1] born?",
+    })
+    answerer = _MockBackend({
+        "Who directed Inception?":   "Christopher Nolan",
+        "Where was Christopher Nolan born?": "London",
+    })
+    consistency = compute_consistency_for_run(
+        questions=["Where was the director of Inception born?"],
+        direct_answers=["London"],
+        answerer=answerer,
+        decomposer=decomposer,
+    )
+    assert consistency == pytest.approx(1.0)
+
+
+def test_compute_consistency_decomp_failure_counts_inconsistent():
+    """If the decomposer returns garbage, that instance is inconsistent."""
+    decomposer = _MockBackend({})  # returns "" for everything → no Q1/Q2 match
+    answerer = _MockBackend({})
+    consistency = compute_consistency_for_run(
+        questions=["Some question"],
+        direct_answers=["Some answer"],
+        answerer=answerer,
+        decomposer=decomposer,
+    )
+    assert consistency == pytest.approx(0.0)
+
+
+def test_compute_consistency_mixed():
+    """Two instances — one consistent, one where answerer's expansion disagrees."""
+    decomposer = _MockBackend({
+        "A?": "Q1: sub-a1?\nQ2: follow-up given [A1]?",
+        "B?": "Q1: sub-b1?\nQ2: follow-up given [A1]?",
+    })
+    answerer = _MockBackend({
+        "sub-a1?": "alpha",
+        "follow-up given alpha?": "correct-A",
+        "sub-b1?": "beta",
+        "follow-up given beta?": "wrong-B",   # disagrees with direct
+    })
+    consistency = compute_consistency_for_run(
+        questions=["A?", "B?"],
+        direct_answers=["correct-A", "expected-B"],
+        answerer=answerer,
+        decomposer=decomposer,
+    )
+    assert consistency == pytest.approx(0.5)

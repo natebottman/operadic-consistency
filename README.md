@@ -1,165 +1,186 @@
 # Operadic Consistency
 
-Operadic Consistency is a lightweight research framework for evaluating
-reasoning robustness of language models via **structured question
-decompositions**.
+A MAGNET-compatible accuracy predictor for the DARPA AIQ evaluation.
 
-The central object is a **Tree of Questions (ToQ)**.
-We evaluate whether collapsing subtrees into single questions preserves
-the final answer.
+`operadic_consistency` provides `OperadicConsistencyPredictor`, a
+`magnet.RunPredictor` that estimates a language model's benchmark accuracy
+without ground-truth labels by using the model's *operadic consistency* as a
+reliability signal. All inference is routed through a swappable backend
+protocol, so the TA2 harness can supply its own LLM endpoint (vLLM, Together,
+mock) and either drive the predictor in a single batched precompute pass or
+let it make calls dynamically.
 
-## Project Layout
+## The signal
 
-```text
-.
-├── operadic_consistency/
-│   ├── core/               # ToQ types, evaluation, metrics, serialization
-│   ├── magnet/             # DARPA AIQ MAGNET predictor (optional)
-│   └── model_interface/    # LLM decomposer/answerer wrappers
-├── tests/                  # pytest suite
-├── docs/                   # usage docs
-├── examples/               # runnable examples
-├── pyproject.toml
-└── README.md
+Given a multi-hop question Q and a model M that has already produced a direct
+answer to Q, we:
+
+1. Decompose Q into two sub-questions Q1 and Q2 (where Q2 depends on the
+   answer to Q1 via an `[A1]` placeholder).
+2. Ask M to answer Q1, getting A1.
+3. Substitute A1 into Q2 and ask M to answer the resulting question, getting
+   an *expansion* answer.
+4. Compare the expansion answer to M's direct answer (token F1 ≥ threshold).
+
+The fraction of sampled instances where expansion and direct agree is M's
+*consistency* on that benchmark. Empirically, consistency and accuracy are
+strongly linearly related across models and datasets; the predictor fits
+`accuracy ≈ slope * consistency + intercept` from calibration runs with known
+accuracy and applies it to held-out runs.
+
+## Install
+
+```bash
+pip install -e ".[magnet]"
 ```
 
-## Core Idea
+This installs `numpy`, `together`, and `magnet` (from the AIQ-Kitware repo).
+Dev extras (`pip install -e ".[dev]"`) give you `pytest` for the test suite.
 
-A complex question is decomposed into smaller subquestions arranged as a tree.
+## MAGNET integration
 
-We then:
+### Construct the predictor
 
-1. Evaluate the full tree (baseline).
-2. Systematically collapse subtrees into single questions.
-3. Re-evaluate.
-4. Compare answers.
-
-If the answer changes under valid collapses, reasoning may be brittle.
-
-## Visual Example
-
-Consider:
-
-> Who was President when WW2 ended?
-
-### Original ToQ
-
-```text
-      (2) Who was President at time [A1]?
-           |
-      (1) When did WW2 end?
-```
-
-Evaluation proceeds bottom-up:
-
--   Node 1 → "1945"
--   Node 2 → "Harry Truman"
-
-Baseline answer: **Harry Truman**
-
-### Collapse Run 1 (no cuts)
-
-We collapse the entire tree into a single question:
-
-```text
-(2) Who was President when WW2 ended?
-```
-
-Answer: **Harry Truman**
-
-### Collapse Run 2 (cut edge 1)
-
-Keep the leaf separate and collapse the root component:
-
-```text
-      (2) Who was President at time [A1]?
-           |
-      (1) When did WW2 end?
-```
-
-This produces the same structure as the original tree.
-
-Answer: **Harry Truman**
-
-If collapsing changes the root answer, reasoning may be inconsistent.
-
-## Core Concepts
-
-### ToQ (Tree of Questions)
-
-A `ToQ` represents a structured decomposition of a question.
-
-Each node:
-
-- Has a question string
-- May contain placeholders like `[A1]`, `[A2]`
-- Refers to answers of child nodes
-
-Example:
-
-```text
-    When did WW2 end?        (node 1)
-    Who was President at time [A1]?   (node 2, root)
-```
-
-### OpenToQ
-
-An `OpenToQ` is a ToQ with explicit external inputs.
-It represents a component extracted during partial collapse.
-
-### Collapser
-
-A `Collapser` maps an `OpenToQ` to a single question.
-
-### Answerer
-
-An `Answerer` maps a fully-instantiated question string to an `Answer`.
-
-### Decomposer
-
-A `QuestionDecomposer` maps a raw question string to a `ToQ`.
-
-## Public API
-
-### `run_consistency_check`
+The predictor needs an **answerer** backend (or a factory that produces one
+per run) and a **decomposer** backend. Backends are `LLMBackend`-typed
+objects with a single `complete(prompt, *, max_tokens, temperature, stop)`
+method — Kitware can implement their own by defining that method on any
+class.
 
 ```python
-run_consistency_check(
-    toq: ToQ,
-    *,
-    answerer: Answerer,
-    collapser: Collapser,
-    normalizer=None,
-    substituter=None,
-    context=None,
-    plan_opts=None,
-    cache=None,
-) -> ConsistencyReport
+from operadic_consistency.magnet import (
+    OperadicConsistencyPredictor,
+    TogetherBackend,
+)
+
+# Fixed answerer for all runs (simplest case)
+predictor = OperadicConsistencyPredictor(
+    answerer=TogetherBackend(model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+                             api_key=TOGETHER_KEY),
+    decomposer=TogetherBackend(model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+                               api_key=TOGETHER_KEY),
+    n_consistency_samples=20,
+    num_example_runs=5,
+    num_eval_samples=20,
+)
 ```
 
-Run the operadic consistency check from a manually constructed `ToQ`.
+### Per-run answerer (self-consistency)
 
-### `run_consistency_check_from_question`
+Consistency of a model X is really a within-X property: "does X's factored
+answer match X's direct answer?" To measure this properly, the answerer must
+match the model that produced each run's direct answers. Pass
+`answerer_factory` to resolve a backend per run:
 
 ```python
-run_consistency_check_from_question(
-    question: str,
-    *,
-    decomposer: QuestionDecomposer,
-    answerer: Answerer,
-    collapser: Collapser,
-    normalizer=None,
-    substituter=None,
-    context=None,
-    plan_opts=None,
-    cache=None,
-) -> ConsistencyReport
+def factory(model_id: str) -> LLMBackend:
+    # Called with the model ID parsed from run_spec.name
+    return TogetherBackend(model=model_id, api_key=TOGETHER_KEY)
+
+predictor = OperadicConsistencyPredictor(
+    answerer_factory=factory,
+    decomposer=TogetherBackend(model="reference-decomposer",
+                               api_key=TOGETHER_KEY),
+)
 ```
 
-Run consistency checking from a raw question.
-The provided decomposer constructs the initial `ToQ`.
+The decomposer stays fixed across runs — it is part of the evaluation
+methodology, not the system being evaluated.
 
-## Minimal Usage Example
+### Batched harness flow (recommended)
+
+The predictor's preferred integration is batched precompute: the harness
+owns all LLM calls and runs them in a small number of large batches. Between
+batches, the predictor tells the harness exactly which prompts it needs next.
+
+```python
+cache: dict[str, str] = {}   # request_id → completion text
+
+while True:
+    batch = predictor.plan_next_batch(train_split, test_split, cache)
+    if not batch:
+        break
+    # harness.run_batch runs every InferenceRequest in the batch however it
+    # wants (vLLM, Together, etc.) and returns {request_id: text}
+    cache.update(harness.run_batch(batch))
+
+predictions = predictor.predict_from_cache(train_split, test_split, cache)
+```
+
+`plan_next_batch` walks up to three sequential phases:
+
+1. **Decompose** each sampled question via the (fixed) decomposer.
+2. **Answer Q1** for every successful decomposition, using the per-run
+   answerer model.
+3. **Answer Q2** with `[A1]` substituted from the cached Q1 answers,
+   using the per-run answerer model.
+
+Each `InferenceRequest` exposes `request_id`, `role` (`"decomposer"` or
+`"answerer"`), `model`, `prompt`, and standard inference knobs
+(`max_tokens`, `temperature`). `request_id` is a deterministic hash of
+`(role, model, prompt)`, so asking the same triple from two runs costs only
+one inference call.
+
+### Dynamic flow (fallback)
+
+If batching is impractical, the predictor can drive the LLM calls itself
+through the configured backends:
+
+```python
+predictions = predictor.predict(train_split, sequestered_test_split)
+```
+
+Semantically identical to the batched path, but all inference happens
+serially inside the predictor.
+
+### Driver script
+
+There is no registration system. Write a small driver and point it at a
+HELM output directory — `RunPredictor.__call__` (inherited from MAGNET)
+handles loading runs, splitting into training and test, and invoking
+`predict`.
+
+```python
+# run_predictor.py
+import argparse
+from operadic_consistency.magnet import OperadicConsistencyPredictor, TogetherBackend
+
+predictor = OperadicConsistencyPredictor(
+    answerer=TogetherBackend(model="...", api_key="..."),
+    decomposer=TogetherBackend(model="...", api_key="..."),
+)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("suite_path",
+                        help="Path to HELM benchmark_output/runs/<suite>")
+    args = parser.parse_args()
+    predictor(args.suite_path)
+```
+
+```bash
+python run_predictor.py path/to/benchmark_output/runs/my_suite
+```
+
+### Calibration fallback behavior
+
+- **2+ training runs**: affine OLS fit (slope and intercept both free).
+- **1 training run**: linear through the origin (slope = accuracy /
+  consistency, intercept = 0).
+- **0 training runs**: identity (predicted accuracy = consistency).
+
+## Core framework
+
+Under the MAGNET predictor sits a small research framework for evaluating
+reasoning robustness via structured question decompositions. The central
+object is a **Tree of Questions (ToQ)** — a tree whose nodes are
+sub-questions with `[A_i]` placeholders referring to child answers. The
+framework lets you systematically collapse subtrees into single questions,
+re-evaluate, and compare answers. The MAGNET predictor is a specific
+instantiation that uses a 2-node chain (Q1 → Q2) and token F1 agreement as
+the consistency metric.
+
+### Minimal ToQ example
 
 ```python
 from operadic_consistency import run_consistency_check
@@ -186,8 +207,6 @@ nodes = {
     1: ToQNode(1, "When did WW2 end?", parent=2),
     2: ToQNode(2, "Who was President at time [A1]?", parent=None),
 }
-
-
 toq = ToQ(nodes=nodes, root_id=2)
 
 report = run_consistency_check(
@@ -195,106 +214,35 @@ report = run_consistency_check(
     answerer=TinyAnswerer(),
     collapser=TinyCollapser(),
 )
-
 print("Baseline root answer:", report.base_root_answer.text)
+```
+
+See [docs/](docs/) for the full core API (`ToQ`, `OpenToQ`, `Collapser`,
+`QuestionDecomposer`, `run_consistency_check`,
+`run_consistency_check_from_question`).
+
+## Project layout
+
+```text
+.
+├── operadic_consistency/
+│   ├── core/               # ToQ types, evaluation, metrics, serialization
+│   ├── magnet/             # MAGNET predictor, LLMBackend, TogetherBackend
+│   └── model_interface/    # (reserved for future non-MAGNET integrations)
+├── tests/                  # pytest suite
+├── docs/                   # usage docs
+├── examples/               # runnable examples
+├── pyproject.toml
+└── README.md
 ```
 
 ## Quickstart
 
-Install package:
-
 ```bash
-pip install -e .
-```
-
-Install development dependencies:
-
-```bash
-pip install -e .[dev]
-```
-
-Run tests:
-
-```bash
-pytest
-```
-
-Run minimal example:
-
-```bash
+pip install -e ".[dev]"   # or ".[magnet]" for the predictor + deps
+pytest                    # run tests
 python examples/minimal_consistency.py
 ```
-
-## MAGNET Integration (DARPA AIQ)
-
-`operadic_consistency.magnet` provides an `OperadicConsistencyPredictor` that
-implements the MAGNET `RunPredictor` interface for the DARPA AIQ TA2 evaluation.
-
-### Idea
-
-Operadic consistency -- whether a model's direct answer to a question agrees
-with the answer it reaches by first answering sub-questions -- correlates
-strongly with accuracy.  The predictor exploits this to estimate accuracy on
-models whose ground-truth labels are held out.
-
-The caller specifies two groups of models:
-
-- **Training runs** (`train_split`): models for which ground-truth accuracy is
-  available.  The predictor computes operadic consistency for each, then fits a
-  linear consistency → accuracy calibration from these pairs.
-- **Test runs** (`sequestered_test_split`): models for which only raw outputs
-  are available.  The predictor computes consistency and maps it to a predicted
-  accuracy via the fitted calibration.
-
-With 1 training run the predictor uses a linear-through-the-origin fit
-(slope = accuracy / consistency, intercept = 0).  With 0 training runs it
-falls back to the identity (predicted accuracy = consistency).
-
-### Install
-
-```bash
-pip install -e ".[magnet]"
-```
-
-This installs `together` (for LLM calls) and `magnet` from the AIQ-Kitware
-repository.
-
-### Usage
-
-There is no registration system.  You write a small driver script, run it
-from the command line, and point it at your HELM output directory.  The
-`RunPredictor.__call__` method (inherited from MAGNET) handles loading the
-HELM runs, partitioning them into training and test splits, and calling
-`predict()`.
-
-```python
-# run_predictor.py
-from operadic_consistency.magnet import OperadicConsistencyPredictor
-
-predictor = OperadicConsistencyPredictor(
-    answerer_model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-    together_api_key="YOUR_KEY",
-    n_consistency_samples=20,
-    num_example_runs=5,   # number of training runs (with known accuracy)
-    num_eval_samples=20,  # instances sampled per run for consistency estimation
-)
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("suite_path", help="Path to HELM benchmark_output/runs/<suite>")
-    args = parser.parse_args()
-    predictor(args.suite_path)
-```
-
-```bash
-python run_predictor.py path/to/benchmark_output/runs/my_suite
-```
-
-`train_split` receives the runs for which MAGNET has ground-truth accuracy
-stats; `sequestered_test_split` receives the remaining runs with stats withheld.
-The predictor fits the calibration from the former and emits `RunPrediction`
-objects for the latter.
 
 ## Docs
 
@@ -304,4 +252,7 @@ objects for the latter.
 
 ## Status
 
-Research prototype. API may evolve.
+Research prototype under active development for the DARPA AIQ May smoketest.
+The MAGNET-facing API (`LLMBackend`, `plan_next_batch`, `predict_from_cache`,
+`answerer_factory`) is stable enough to build against; the core ToQ
+framework API may still evolve.

@@ -46,6 +46,22 @@ htmlcov/
 .idea/
 
 # =========================
+# Research scratchpad (experiment runners, plots, local loaders)
+# =========================
+scripts/
+
+# =========================
+# Experiment results (large JSON data files)
+# =========================
+results/
+experiments/**/*.json
+
+# =========================
+# PowerPoint files
+# =========================
+*.pptx
+
+# =========================
 # Misc
 # =========================
 *.log
